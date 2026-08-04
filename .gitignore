@@ -1,0 +1,20 @@
+# Secrets — never commit
+config.toml
+.env
+*.key
+*_key
+id_ed25519*
+totp.secret
+
+# Runtime state
+state.json
+var/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
