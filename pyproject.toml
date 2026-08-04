@@ -6,5 +6,6 @@ dependencies = ["aiogram==3.15.0", "pydantic-settings==2.7.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = ["requires_socat: needs a real socat binary and Linux /proc"]

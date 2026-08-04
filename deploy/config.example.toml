@@ -1,5 +1,7 @@
 # Copy to /etc/safe-connect/config.toml. The bot token does NOT belong here —
 # it is read from SAFE_CONNECT_TELEGRAM_TOKEN, supplied by systemd's EnvironmentFile.
+# A telegram_token key in this file is enforced to be ignored: load_config() strips
+# it before construction, so the environment variable always wins.
 
 telegram_user_id = 000000000        # your numeric Telegram user ID
 vds_public_ip = "198.51.100.7"      # the address you will point mstsc at

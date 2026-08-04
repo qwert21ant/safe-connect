@@ -53,3 +53,10 @@ def test_rejects_unknown_key(tmp_path, monkeypatch):
     monkeypatch.setenv("SAFE_CONNECT_TELEGRAM_TOKEN", "123:ABC")
     with pytest.raises(ValueError):
         load_config(write_cfg(tmp_path, MINIMAL + '\nnonsense = "x"\n'))
+
+
+def test_a_token_in_the_toml_file_cannot_override_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAFE_CONNECT_TELEGRAM_TOKEN", "from-env")
+    body = MINIMAL + '\ntelegram_token = "from-toml"\n'
+    cfg = load_config(write_cfg(tmp_path, body))
+    assert cfg.telegram_token.get_secret_value() == "from-env"

@@ -52,4 +52,8 @@ class Config(BaseSettings):
 
 def load_config(path: Path) -> Config:
     data = tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    # The token is env-only (SAFE_CONNECT_TELEGRAM_TOKEN): init kwargs take
+    # precedence over env vars in pydantic-settings, so a stray key here would
+    # silently override the environment. Drop it rather than let that happen.
+    data.pop("telegram_token", None)
     return Config(**data)
