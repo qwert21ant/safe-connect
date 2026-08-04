@@ -351,6 +351,24 @@ import ipaddress
 
 ANY = "any"
 
+# Enumerated rather than derived from ipaddress's classification properties.
+# `is_private` treats the RFC 5737 documentation ranges (including 203.0.113.0/24,
+# this project's canonical example address) as private, and on Python 3.12.3 it
+# does NOT cover 100.64.0.0/10 — the Tailscale range, which must be rejected.
+# Its meaning has also shifted between releases. Pinning the ranges here makes
+# the behaviour version-independent.
+_REJECTED_NETWORKS = (
+    ipaddress.IPv4Network("0.0.0.0/8"),        # unspecified / "this network"
+    ipaddress.IPv4Network("10.0.0.0/8"),       # RFC1918
+    ipaddress.IPv4Network("100.64.0.0/10"),    # CGNAT — also the Tailscale range
+    ipaddress.IPv4Network("127.0.0.0/8"),      # loopback
+    ipaddress.IPv4Network("169.254.0.0/16"),   # link-local
+    ipaddress.IPv4Network("172.16.0.0/12"),    # RFC1918
+    ipaddress.IPv4Network("192.168.0.0/16"),   # RFC1918
+    ipaddress.IPv4Network("224.0.0.0/4"),      # multicast
+    ipaddress.IPv4Network("240.0.0.0/4"),      # reserved
+)
+
 
 class InvalidSource(ValueError):
     """The operator's source argument is not an acceptable public IPv4 host."""
@@ -369,14 +387,7 @@ def parse_source(raw: str) -> str:
         address = ipaddress.IPv4Address(candidate)
     except ipaddress.AddressValueError as exc:
         raise InvalidSource(f"not an IPv4 address: {raw!r}") from exc
-    if (
-        address.is_private          # includes 100.64/10, the tailnet range
-        or address.is_loopback
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_link_local
-        or address.is_unspecified
-    ):
+    if any(address in network for network in _REJECTED_NETWORKS):
         raise InvalidSource(f"not a routable public address: {address}")
     return f"{address}/32"
 ```
