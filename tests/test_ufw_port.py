@@ -60,6 +60,9 @@ def test_any_opens_the_port_to_all_sources(fake_ufw):
         ("flush", "40017", "203.0.113.9/32"),         # unknown action
         ("open", "40017"),                            # too few arguments
         ("open", "40017", "203.0.113.9/32", "extra"),  # too many
+        ("open", "40017", "203.008.1.1/32"),          # leading-zero octet (ambiguous octal)
+        ("open", "40017", "203.000.1.1/32"),          # leading-zero octet, all zeros
+        ("open", "40017", "203.09.1.1/32"),           # leading-zero octet, two digits
     ],
 )
 def test_invalid_input_is_refused_without_touching_ufw(fake_ufw, args):
