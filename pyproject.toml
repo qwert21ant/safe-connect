@@ -1,0 +1,10 @@
+[project]
+name = "safe-connect"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["aiogram==3.15.0", "pydantic-settings==2.7.0"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["requires_socat: needs a real socat binary and Linux /proc"]

@@ -1,0 +1,15 @@
+# Copy to /etc/safe-connect/config.toml. The bot token does NOT belong here —
+# it is read from SAFE_CONNECT_TELEGRAM_TOKEN, supplied by systemd's EnvironmentFile.
+
+telegram_user_id = 000000000        # your numeric Telegram user ID
+vds_public_ip = "198.51.100.7"      # the address you will point mstsc at
+pc1_tailnet_ip = "100.101.102.103"  # PC1's 100.x address from `tailscale status`
+pc1_ssh_user = "rdpadmin"           # the PC1 account holding the forced-command key
+pc1_ssh_key_path = "/var/lib/safe-connect/id_ed25519"
+
+# port_range_start = 40000
+# port_range_end = 40100
+# connect_grace_seconds = 300
+# idle_timeout_seconds = 600
+# hard_cap_seconds = 28800
+# poll_interval_seconds = 30
