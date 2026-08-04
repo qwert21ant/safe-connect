@@ -792,7 +792,7 @@ async def test_start_opens_ufw_before_spawning_socat():
     ]
     assert spawned[0] == [
         "/usr/bin/socat",
-        "TCP-LISTEN:40017,fork,reuseaddr,range=203.0.113.9/32",
+        "TCP4-LISTEN:40017,fork,reuseaddr,range=203.0.113.9/32",
         "TCP:100.101.102.103:3389",
     ]
 
@@ -806,7 +806,7 @@ async def test_source_any_omits_the_socat_range_option():
         return FakeProcess()
 
     await Forwarder(make_config(), runner=runner, spawn=spawn).start(40017, "any")
-    assert spawned[0][1] == "TCP-LISTEN:40017,fork,reuseaddr"
+    assert spawned[0][1] == "TCP4-LISTEN:40017,fork,reuseaddr"
 
 
 async def test_ufw_rule_is_rolled_back_when_socat_never_listens():
@@ -935,7 +935,7 @@ class Forwarder:
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             return False
-        return b"socat" in cmdline and f"TCP-LISTEN:{port}".encode() in cmdline
+        return b"socat" in cmdline and f"TCP4-LISTEN:{port}".encode() in cmdline
 
     async def established_count(self, port: int) -> int:
         result = await self._run(
@@ -956,7 +956,10 @@ class Forwarder:
             raise ForwarderError(f"ufw-port {action} failed: {result.stderr.strip()}")
 
     def _socat_argv(self, port: int, source: str) -> list[str]:
-        listen = f"TCP-LISTEN:{port},fork,reuseaddr"
+        # TCP4-LISTEN, not TCP-LISTEN: socat 1.8.0 refuses an IPv4 `range=` on a
+        # dual-stack listener ("syntax error in range ... of unspecified address
+        # family"). The forwarded protocol and the ufw rule are both IPv4 anyway.
+        listen = f"TCP4-LISTEN:{port},fork,reuseaddr"
         if source != "any":
             listen += f",range={source}"
         return [
