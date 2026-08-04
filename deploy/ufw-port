@@ -1,0 +1,56 @@
+#!/bin/bash
+# Root-owned. The only command the `safeconnect` user may run under sudo.
+#
+#   ufw-port open|close <port> <source>
+#     <port>    integer inside PORT_MIN..PORT_MAX
+#     <source>  "any", or a single-host CIDR such as 203.0.113.9/32
+#
+# SAFE_CONNECT_UFW / SAFE_CONNECT_PORT_MIN / SAFE_CONNECT_PORT_MAX exist for the
+# test suite. They are unreachable through the sudo path because sudo's default
+# env_reset discards the caller's environment. Never add env_keep for them.
+set -euo pipefail
+
+PORT_MIN="${SAFE_CONNECT_PORT_MIN:-40000}"
+PORT_MAX="${SAFE_CONNECT_PORT_MAX:-40100}"
+UFW="${SAFE_CONNECT_UFW:-/usr/sbin/ufw}"
+
+die() { printf 'ufw-port: %s\n' "$1" >&2; exit 2; }
+
+[ "$#" -eq 3 ] || die "usage: ufw-port open|close <port> <source>"
+
+action="$1"
+port="$2"
+source="$3"
+
+case "$action" in
+  open|close) ;;
+  *) die "unknown action: $action" ;;
+esac
+
+[[ "$port" =~ ^[0-9]{1,5}$ ]] || die "port is not numeric: $port"
+[ "$port" -ge "$PORT_MIN" ] && [ "$port" -le "$PORT_MAX" ] \
+  || die "port $port is outside the permitted range $PORT_MIN-$PORT_MAX"
+
+if [ "$source" != "any" ]; then
+  [[ "$source" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/32$ ]] || die "bad source: $source"
+  IFS='./' read -r o1 o2 o3 o4 _ <<< "$source"
+  for octet in "$o1" "$o2" "$o3" "$o4"; do
+    [ "$octet" -le 255 ] || die "bad source octet in: $source"
+  done
+fi
+
+host="${source%/32}"
+
+if [ "$action" = "open" ]; then
+  if [ "$source" = "any" ]; then
+    "$UFW" allow "${port}/tcp"
+  else
+    "$UFW" allow from "$host" to any port "$port" proto tcp
+  fi
+else
+  if [ "$source" = "any" ]; then
+    "$UFW" delete allow "${port}/tcp"
+  else
+    "$UFW" delete allow from "$host" to any port "$port" proto tcp
+  fi
+fi
