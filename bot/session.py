@@ -229,3 +229,92 @@ class SessionManager:
         return (f"Open at `{self._config.vds_public_ip}:{self.state.port}`\n"
                 f"Source: `{self.state.source}`\n"
                 f"{idle_line}\nHard cap in {max(hard_left, 0)}m.")
+
+    # -- timers ----------------------------------------------------------
+
+    async def tick(self) -> None:
+        """Advance the session's timers. Called every poll_interval_seconds.
+
+        Runs on the event loop independently of Telegram, so a Telegram outage
+        delays notifications but never the teardown itself.
+        """
+        if self.state.state is not State.OPEN:
+            return
+
+        port = self.state.port
+        pid = self.state.socat_pid
+        if port is None:
+            return
+
+        if pid is not None and not self._forwarder.is_alive(pid, port):
+            log.error("socat died unexpectedly on port %s", port)
+            await self._close_and_notify("the forwarder exited unexpectedly")
+            return
+
+        try:
+            if await self._forwarder.established_count(port) > 0:
+                self.state.saw_connection = True
+                self.state.last_connection_at = self._clock.now()
+                self._save()
+        except ForwarderError as exc:
+            log.warning("could not sample connections: %s", exc)
+
+        now = self._clock.now()
+        opened_at = self.state.opened_at or now
+        age = now - opened_at
+
+        if age >= self._config.hard_cap_seconds:
+            await self._close_and_notify(
+                f"maximum session length of {self._config.hard_cap_seconds // 3600}h reached"
+            )
+            return
+
+        warn_at = self._config.hard_cap_seconds - self._config.hard_cap_warning_seconds
+        if age >= warn_at and not self.state.hard_cap_warned:
+            self.state.hard_cap_warned = True
+            self._save()
+            await self._notifier.send(
+                f"Heads up: this session hits its maximum length in "
+                f"{self._config.hard_cap_warning_seconds // 60} min and will close."
+            )
+
+        if not self.state.saw_connection:
+            if age >= self._config.connect_grace_seconds:
+                await self._close_and_notify(
+                    f"no connection arrived within "
+                    f"{self._config.connect_grace_seconds // 60} min"
+                )
+            return
+
+        last = self.state.last_connection_at or opened_at
+        if now - last >= self._config.idle_timeout_seconds:
+            await self._close_and_notify(
+                f"idle for {self._config.idle_timeout_seconds // 60} min"
+            )
+
+    async def _close_and_notify(self, reason: str) -> None:
+        await self._notifier.send(await self.close(reason))
+
+    # -- startup ---------------------------------------------------------
+
+    async def reconcile(self) -> None:
+        """Make reality and the state file agree after a restart.
+
+        The file is evidence, not truth: an OPEN record whose socat is gone means
+        a half-open session, which is torn down rather than trusted.
+        """
+        if self.state.state is State.CLOSED:
+            return
+
+        port, pid = self.state.port, self.state.socat_pid
+        if (self.state.state is State.OPEN and port is not None
+                and pid is not None and self._forwarder.is_alive(pid, port)):
+            log.info("adopted a live session on port %s", port)
+            await self._notifier.send(
+                f"Bot restarted; resumed tracking the open session on "
+                f"`{self._config.vds_public_ip}:{port}`."
+            )
+            return
+
+        log.warning("stale %s state on startup, tearing down", self.state.state.value)
+        await self._close_and_notify("cleanup after a bot restart")
