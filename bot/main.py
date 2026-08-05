@@ -21,9 +21,9 @@ log = logging.getLogger(__name__)
 CONFIG_PATH = Path(os.environ.get("SAFE_CONNECT_CONFIG", "/etc/safe-connect/config.toml"))
 
 USAGE = (
-    "Usage: `/rdp_on <your public IP>`\n"
-    "For example `/rdp_on 203.0.113.9`.\n\n"
-    "`/rdp_on any` opens the port to every source address. "
+    "Usage: /rdp_on <your public IP>\n"
+    "For example: /rdp_on 203.0.113.9\n\n"
+    "/rdp_on any opens the port to every source address. "
     "That drops the IP restriction entirely — only the random port and your "
     "Windows password stand between the internet and PC1."
 )
@@ -65,7 +65,7 @@ async def handle_rdp_on(text: str, manager: SessionManager) -> str:
         return f"That is not a usable source address: {exc}\n\n{USAGE}"
     reply = await manager.open(source)
     if source == "any":
-        reply += "\n\nOpened to *any* source address."
+        reply += "\n\nOpened to ANY source address."
     return reply
 
 
@@ -79,11 +79,12 @@ def handle_status(manager: SessionManager) -> str:
 
 def handle_help() -> str:
     return (
-        "*Safe Connect*\n"
-        "`/rdp_on <ip>` — enable RDP on PC1 and open a port for that address\n"
-        "`/rdp_off` — close the port and disable RDP\n"
-        "`/status` — current state and time remaining\n"
-        "`/help` — this message"
+        "Safe Connect\n"
+        "\n"
+        "/rdp_on <ip> — enable RDP on PC1 and open a port for that address\n"
+        "/rdp_off — close the port and disable RDP\n"
+        "/status — current state and time remaining\n"
+        "/help — this message"
     )
 
 

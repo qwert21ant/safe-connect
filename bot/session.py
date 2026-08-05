@@ -112,7 +112,7 @@ class SessionManager:
         except PC1Error as exc:
             log.warning("enabling RDP on PC1 failed: %s", exc)
             self._reset()
-            return f"PC1 unreachable — is it powered on and on the tailnet?\n\n`{exc}`"
+            return f"PC1 unreachable — is it powered on and on the tailnet?\n\n{exc}"
 
         if not await self._pc1.probe_rdp():
             log.warning("RDP probe failed after enable")
@@ -133,8 +133,8 @@ class SessionManager:
         self._save()
 
         log.info("session open on %s for %s", port, source)
-        return (f"RDP open at `{self._config.vds_public_ip}:{port}`\n"
-                f"Source: `{source}`\n"
+        return (f"RDP open at {self._config.vds_public_ip}:{port}\n"
+                f"Source: {source}\n"
                 f"Closes after {self._config.idle_timeout_seconds // 60} min idle, "
                 f"or {self._config.hard_cap_seconds // 3600} h maximum.")
 
@@ -226,8 +226,8 @@ class SessionManager:
         else:
             grace_left = int((self._config.connect_grace_seconds - (now - opened_at)) // 60)
             idle_line = f"No connection yet; closes in {max(grace_left, 0)}m if none arrives."
-        return (f"Open at `{self._config.vds_public_ip}:{self.state.port}`\n"
-                f"Source: `{self.state.source}`\n"
+        return (f"Open at {self._config.vds_public_ip}:{self.state.port}\n"
+                f"Source: {self.state.source}\n"
                 f"{idle_line}\nHard cap in {max(hard_left, 0)}m.")
 
     # -- timers ----------------------------------------------------------
@@ -312,7 +312,7 @@ class SessionManager:
             log.info("adopted a live session on port %s", port)
             await self._notifier.send(
                 f"Bot restarted; resumed tracking the open session on "
-                f"`{self._config.vds_public_ip}:{port}`."
+                f"{self._config.vds_public_ip}:{port}."
             )
             return
 

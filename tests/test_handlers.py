@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from bot.main import (
+    USAGE,
     AuthMiddleware,
     _reply,
     handle_help,
@@ -90,6 +91,32 @@ async def test_a_markdown_breaking_rdp_on_reply_still_reaches_the_operator(manag
     sent_text, kwargs = message.sent[0]
     assert sent_text == reply
     assert "parse_mode" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["USAGE", "handle_help()", "manager.open(...) success", "manager.describe() while open"],
+)
+async def test_reply_producing_text_has_no_markdown_markup(manager, parts, label):
+    # Every send site was switched to plain text (no parse_mode) so an
+    # unescaped interpolated value can never make a send fail. That only
+    # holds if the strings themselves stop assuming Markdown rendering --
+    # otherwise the operator sees raw backticks and asterisks in ordinary,
+    # successful replies. This pins that none of the hand-written literals
+    # that make up a reply still carry markup, across both bot/main.py and
+    # bot/session.py (manager.open/describe live in the latter).
+    if label == "USAGE":
+        text = USAGE
+    elif label == "handle_help()":
+        text = handle_help()
+    elif label == "manager.open(...) success":
+        text = await manager.open("203.0.113.9/32")
+    else:
+        await manager.open("203.0.113.9/32")
+        text = manager.describe()
+
+    assert "`" not in text, f"{label} still contains a backtick: {text!r}"
+    assert "*" not in text, f"{label} still contains an asterisk: {text!r}"
 
 
 async def test_rdp_on_any_is_accepted_and_warned_about(manager, parts):
