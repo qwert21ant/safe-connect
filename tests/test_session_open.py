@@ -2,8 +2,16 @@ import json
 
 import pytest
 
-from bot.pc1 import PC1Error
-from bot.session import State
+from bot.pc1 import PC1Client, PC1Error
+from bot.proc import ProcTimeout
+from bot.session import SessionManager, State
+
+
+class TimingOutRunner:
+    """Simulates proc.run() timing out and raising ProcTimeout."""
+
+    async def __call__(self, argv, timeout=30.0):
+        raise ProcTimeout(f"timed out after {timeout}s: {argv[0]}")
 
 
 async def test_open_prepares_pc1_before_any_public_port_exists(manager, parts):
@@ -120,3 +128,20 @@ async def test_pc1_prep_happens_strictly_before_forwarder_start(manager, parts):
     await manager.open("203.0.113.9/32")
 
     assert events == ["pc1-probe", "forwarder-start"]
+
+
+async def test_open_recovers_to_closed_when_pc1_enable_times_out(parts):
+    """A hung SSH during enable() must not leave state.json stuck at OPENING.
+
+    Uses a real PC1Client (not FakePC1) with a runner that raises ProcTimeout,
+    so this exercises the actual boundary-wrapping fix in bot/pc1.py, not just
+    a fake that happens to raise the "convenient" exception type.
+    """
+    parts["pc1"] = PC1Client(parts["config"], runner=TimingOutRunner())
+    manager = SessionManager(**parts)
+
+    await manager.open("203.0.113.9/32")
+
+    assert manager.state.state is State.CLOSED
+    saved = json.loads(parts["config"].state_path.read_text())
+    assert saved["state"] == "closed"

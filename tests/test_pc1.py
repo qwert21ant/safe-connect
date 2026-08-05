@@ -3,8 +3,15 @@ import json
 import pytest
 
 from bot.pc1 import AuditReport, PC1Client, PC1Error
-from bot.proc import Result
+from bot.proc import ProcTimeout, Result
 from tests.test_forwarder import FakeRunner, make_config
+
+
+class TimingOutRunner:
+    """Simulates proc.run() timing out and raising ProcTimeout."""
+
+    async def __call__(self, argv, timeout=30.0):
+        raise ProcTimeout(f"timed out after {timeout}s: {argv[0]}")
 
 
 def ssh_argv(verb: str) -> list[str]:
@@ -96,3 +103,14 @@ async def test_audit_rejects_infinity_epoch():
     client = PC1Client(make_config(), runner=FakeRunner())
     with pytest.raises(PC1Error):
         await client.audit(float("inf"))
+
+
+async def test_ssh_timeout_raises_pc1_error_not_proctimeout():
+    """A hung SSH to PC1 must surface as PC1Error, the vocabulary session.py
+
+    catches -- not as the runner's bare ProcTimeout, which nothing in bot/
+    catches and which would otherwise escape enable()/disable()/audit().
+    """
+    client = PC1Client(make_config(), runner=TimingOutRunner())
+    with pytest.raises(PC1Error):
+        await client.enable()

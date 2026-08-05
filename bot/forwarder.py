@@ -8,6 +8,7 @@ from pathlib import Path
 
 from bot import proc
 from bot.config import Config
+from bot.proc import ProcTimeout
 
 RDP_PORT = 3389
 _LISTEN_POLL_INTERVAL = 0.1
@@ -72,9 +73,12 @@ class Forwarder:
         return b"socat" in cmdline and f"TCP4-LISTEN:{port}".encode() in cmdline
 
     async def established_count(self, port: int) -> int:
-        result = await self._run(
-            [str(self._config.ss_path), "-Htn", "state", "established", f"( sport = :{port} )"]
-        )
+        try:
+            result = await self._run(
+                [str(self._config.ss_path), "-Htn", "state", "established", f"( sport = :{port} )"]
+            )
+        except ProcTimeout as exc:
+            raise ForwarderError(f"ss timed out: {exc}") from exc
         if not result.ok:
             raise ForwarderError(f"ss failed: {result.stderr.strip()}")
         return len([line for line in result.stdout.splitlines() if line.strip()])
@@ -82,10 +86,13 @@ class Forwarder:
     # -- internals -------------------------------------------------------
 
     async def _ufw(self, action: str, port: int, source: str) -> None:
-        result = await self._run([
-            str(self._config.sudo_path), "-n", str(self._config.ufw_port_helper),
-            action, str(port), source,
-        ])
+        try:
+            result = await self._run([
+                str(self._config.sudo_path), "-n", str(self._config.ufw_port_helper),
+                action, str(port), source,
+            ])
+        except ProcTimeout as exc:
+            raise ForwarderError(f"ufw-port {action} timed out: {exc}") from exc
         if not result.ok:
             raise ForwarderError(f"ufw-port {action} failed: {result.stderr.strip()}")
 
@@ -122,9 +129,12 @@ class Forwarder:
         raise ForwarderError(f"socat did not listen on {port} within 2s")
 
     async def _is_listening(self, port: int) -> bool:
-        result = await self._run(
-            [str(self._config.ss_path), "-Hltn", f"( sport = :{port} )"]
-        )
+        try:
+            result = await self._run(
+                [str(self._config.ss_path), "-Hltn", f"( sport = :{port} )"]
+            )
+        except ProcTimeout as exc:
+            raise ForwarderError(f"ss timed out: {exc}") from exc
         return result.ok and bool(result.stdout.strip())
 
     def _terminate(self, pid: int) -> None:

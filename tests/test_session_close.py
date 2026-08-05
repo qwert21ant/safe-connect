@@ -90,3 +90,23 @@ async def test_forwarder_stop_happens_strictly_before_pc1_disable(manager, parts
     await manager.close("operator request")
 
     assert events == ["forwarder-stop", "pc1-disable"]
+
+
+async def test_close_still_attempts_pc1_disable_when_forwarder_stop_raises_unexpectedly(manager, parts):
+    """The fail-forward guarantee is "pc1.disable() is always attempted once
+
+    listener teardown has been tried" -- an exception type nobody anticipated
+    coming out of forwarder.stop() must not be able to skip it.
+    """
+    await manager.open("203.0.113.9/32")
+    parts["pc1"].calls.clear()
+
+    async def stop(pid, port, source):
+        raise RuntimeError("unexpected failure unrelated to ForwarderError")
+
+    parts["forwarder"].stop = stop
+
+    await manager.close("operator request")
+
+    assert "disable" in parts["pc1"].calls
+    assert manager.state.state is State.CLOSED

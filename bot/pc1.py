@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from bot import proc
 from bot.config import Config
+from bot.proc import ProcTimeout
 
 RDP_PORT = 3389
 
@@ -88,7 +89,10 @@ class PC1Client:
         ]
 
     async def _call(self, remote_command: str) -> dict:
-        result = await self._run(self._ssh_argv(remote_command))
+        try:
+            result = await self._run(self._ssh_argv(remote_command))
+        except ProcTimeout as exc:
+            raise PC1Error(f"ssh to PC1 timed out: {exc}") from exc
         if not result.ok:
             raise PC1Error(f"ssh to PC1 failed ({result.returncode}): {result.stderr.strip()}")
         try:

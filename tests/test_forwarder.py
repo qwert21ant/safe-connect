@@ -5,7 +5,7 @@ import pytest
 
 from bot.config import Config
 from bot.forwarder import Forwarder, ForwarderError
-from bot.proc import Result
+from bot.proc import ProcTimeout, Result
 
 
 def make_config(**overrides) -> Config:
@@ -32,6 +32,13 @@ class FakeRunner:
         if self.results:
             return self.results.pop(0)
         return Result(0, "", "")
+
+
+class TimingOutRunner:
+    """Simulates proc.run() timing out and raising ProcTimeout."""
+
+    async def __call__(self, argv, timeout=30.0):
+        raise ProcTimeout(f"timed out after {timeout}s: {argv[0]}")
 
 
 class FakeProcess:
@@ -113,6 +120,20 @@ async def test_start_raises_when_ufw_refuses():
         await Forwarder(make_config(), runner=runner, spawn=spawn).start(40017, "any")
 
 
+async def test_start_raises_forwarder_error_not_proctimeout_when_ufw_times_out():
+    """A wedged ufw-port helper must surface as ForwarderError, the vocabulary
+
+    session.py catches -- not as the runner's bare ProcTimeout, which nothing
+    in bot/ catches and which would otherwise escape start().
+    """
+
+    async def spawn(*argv, **kwargs):
+        raise AssertionError("socat must not be spawned when ufw timed out")
+
+    with pytest.raises(ForwarderError):
+        await Forwarder(make_config(), runner=TimingOutRunner(), spawn=spawn).start(40017, "any")
+
+
 async def test_stop_kills_socat_before_closing_ufw():
     """Order matters: the public listener must die first.
 
@@ -184,6 +205,28 @@ async def test_established_count_raises_when_ss_fails():
     fwd = Forwarder(make_config(), runner=runner, spawn=None)
     with pytest.raises(ForwarderError):
         await fwd.established_count(40017)
+
+
+async def test_established_count_raises_forwarder_error_not_proctimeout_when_ss_times_out():
+    fwd = Forwarder(make_config(), runner=TimingOutRunner(), spawn=None)
+    with pytest.raises(ForwarderError):
+        await fwd.established_count(40017)
+
+
+async def test_start_raises_forwarder_error_when_listen_check_times_out():
+    """_is_listening() must also wrap ProcTimeout, not just _ufw()."""
+
+    class OpenThenTimingOutRunner:
+        async def __call__(self, argv, timeout=30.0):
+            if argv[0] == "/usr/bin/sudo":
+                return Result(0, "", "")  # ufw open succeeds
+            raise ProcTimeout("ss timed out")  # the listen-check (ss) never answers
+
+    async def spawn(*argv, **kwargs):
+        return FakeProcess()
+
+    with pytest.raises(ForwarderError):
+        await Forwarder(make_config(), runner=OpenThenTimingOutRunner(), spawn=spawn).start(40017, "any")
 
 
 def test_is_alive_is_false_for_a_pid_that_does_not_exist():

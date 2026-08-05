@@ -171,8 +171,10 @@ class SessionManager:
         if port is not None and source is not None:
             try:
                 await self._forwarder.stop(pid, port, source)
-            except ForwarderError as exc:
-                log.error("stopping the forwarder failed: %s", exc)
+            except Exception as exc:  # noqa: BLE001 -- fail-forward: pc1.disable()
+                # below must always be attempted once teardown has been tried,
+                # so an exception type we didn't anticipate must not skip it.
+                log.error("stopping the forwarder failed: %s", exc, exc_info=True)
 
         pc1_ok = True
         try:
