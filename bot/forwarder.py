@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 from pathlib import Path
 
 from bot import proc
@@ -11,6 +12,8 @@ from bot.config import Config
 RDP_PORT = 3389
 _LISTEN_POLL_INTERVAL = 0.1
 _LISTEN_POLL_ATTEMPTS = 20
+_TERMINATE_POLL_INTERVAL = 0.05
+_TERMINATE_POLL_ATTEMPTS = 10  # ~0.5s of grace after SIGTERM before SIGKILL
 
 
 class ForwarderError(RuntimeError):
@@ -39,16 +42,27 @@ class Forwarder:
             raise
 
     async def stop(self, pid: int | None, port: int, source: str) -> None:
+        # The ufw close must run on every path through here, even if
+        # _terminate() raises (e.g. PermissionError signalling the pid) --
+        # otherwise a failed kill would leave the public port open. We stash
+        # the error and re-raise it only after the close has run.
+        terminate_error: Exception | None = None
         if pid is not None:
-            self._terminate(pid)
-            process = self._processes.pop(pid, None)
-            if process is not None:
-                # Reap it here, while our event loop is still open: otherwise
-                # asyncio's subprocess transport finalizes itself later via
-                # __del__, which can fire after the loop has closed and print
-                # "Exception ignored ... Event loop is closed" noise.
-                await process.wait()
+            try:
+                self._terminate(pid)
+            except Exception as exc:  # noqa: BLE001 -- re-raised below, never swallowed
+                terminate_error = exc
+            else:
+                process = self._processes.pop(pid, None)
+                if process is not None:
+                    # Reap it here, while our event loop is still open: otherwise
+                    # asyncio's subprocess transport finalizes itself later via
+                    # __del__, which can fire after the loop has closed and print
+                    # "Exception ignored ... Event loop is closed" noise.
+                    await process.wait()
         await self._ufw("close", port, source)
+        if terminate_error is not None:
+            raise terminate_error
 
     def is_alive(self, pid: int, port: int) -> bool:
         try:
@@ -114,10 +128,37 @@ class Forwarder:
         return result.ok and bool(result.stdout.strip())
 
     def _terminate(self, pid: int) -> None:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
+        # SIGTERM first, then poll for the pid to actually exit before ever
+        # sending SIGKILL. Firing both signals back-to-back with no liveness
+        # check would risk the SIGKILL landing on a different process if the
+        # OS recycled the pid in between.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            raise ForwarderError(f"not permitted to signal pid {pid}")
+
+        for _ in range(_TERMINATE_POLL_ATTEMPTS):
+            if not self._pid_exists(pid):
                 return
-            except PermissionError:
-                raise ForwarderError(f"not permitted to signal pid {pid}")
+            time.sleep(_TERMINATE_POLL_INTERVAL)
+
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            raise ForwarderError(f"not permitted to signal pid {pid}")
+
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Exists but we can't probe it -- treat as still alive so we
+            # don't escalate to SIGKILL prematurely.
+            return True
+        return True

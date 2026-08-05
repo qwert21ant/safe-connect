@@ -1,3 +1,4 @@
+import signal
 from pathlib import Path
 
 import pytest
@@ -113,15 +114,36 @@ async def test_start_raises_when_ufw_refuses():
 
 
 async def test_stop_kills_socat_before_closing_ufw():
-    """Order matters: the public listener must die first."""
-    runner = FakeRunner()
+    """Order matters: the public listener must die first.
+
+    Both events are recorded into ONE shared, ordered list so the test
+    actually discriminates the sequencing: if stop() were reordered to
+    close the ufw rule before killing socat, `events` would come out as
+    ["ufw-close", "kill"] and this test would fail.
+    """
+    events: list[str] = []
     killed = []
+
+    class OrderTrackingRunner(FakeRunner):
+        async def __call__(self, argv, timeout=30.0):
+            result = await super().__call__(argv, timeout=timeout)
+            if list(argv)[-3:] == ["close", "40017", "203.0.113.9/32"]:
+                events.append("ufw-close")
+            return result
+
+    runner = OrderTrackingRunner()
     fwd = Forwarder(make_config(), runner=runner, spawn=None)
-    fwd._terminate = lambda pid: killed.append(pid)   # noqa: SLF001
+
+    def fake_terminate(pid):
+        killed.append(pid)
+        events.append("kill")
+
+    fwd._terminate = fake_terminate   # noqa: SLF001
 
     await fwd.stop(4242, 40017, "203.0.113.9/32")
 
     assert killed == [4242]
+    assert events == ["kill", "ufw-close"]
     assert runner.calls[0][-3:] == ["close", "40017", "203.0.113.9/32"]
 
 
@@ -130,6 +152,22 @@ async def test_stop_still_closes_ufw_when_pid_is_unknown():
     fwd = Forwarder(make_config(), runner=runner, spawn=None)
     await fwd.stop(None, 40017, "any")
     assert runner.calls[0][-3:] == ["close", "40017", "any"]
+
+
+async def test_stop_still_closes_ufw_when_terminate_fails():
+    """A failed kill must not leave the public port open."""
+    runner = FakeRunner()
+    fwd = Forwarder(make_config(), runner=runner, spawn=None)
+
+    def failing_terminate(pid):
+        raise ForwarderError(f"not permitted to signal pid {pid}")
+
+    fwd._terminate = failing_terminate   # noqa: SLF001
+
+    with pytest.raises(ForwarderError):
+        await fwd.stop(4242, 40017, "203.0.113.9/32")
+
+    assert runner.calls[0][-3:] == ["close", "40017", "203.0.113.9/32"]
 
 
 async def test_established_count_counts_ss_output_lines():
@@ -151,3 +189,45 @@ async def test_established_count_raises_when_ss_fails():
 def test_is_alive_is_false_for_a_pid_that_does_not_exist():
     fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
     assert fwd.is_alive(999999, 40017) is False
+
+
+def test_terminate_skips_sigkill_when_sigterm_is_enough(monkeypatch):
+    """No liveness recheck between signals risks SIGKILL hitting a recycled pid."""
+    fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
+    signals_sent = []
+    alive = True
+
+    def fake_kill(pid, sig):
+        nonlocal alive
+        if sig == signal.SIGTERM:
+            signals_sent.append(sig)
+            alive = False
+        elif sig == 0:
+            if not alive:
+                raise ProcessLookupError
+        else:
+            signals_sent.append(sig)
+
+    monkeypatch.setattr("bot.forwarder.os.kill", fake_kill)
+    monkeypatch.setattr("bot.forwarder.time.sleep", lambda seconds: None)
+
+    fwd._terminate(4242)
+
+    assert signals_sent == [signal.SIGTERM]
+
+
+def test_terminate_escalates_to_sigkill_when_process_survives_sigterm(monkeypatch):
+    fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
+    signals_sent = []
+
+    def fake_kill(pid, sig):
+        # The process never reports as gone via the signal-0 liveness probe.
+        if sig != 0:
+            signals_sent.append(sig)
+
+    monkeypatch.setattr("bot.forwarder.os.kill", fake_kill)
+    monkeypatch.setattr("bot.forwarder.time.sleep", lambda seconds: None)
+
+    fwd._terminate(4242)
+
+    assert signals_sent == [signal.SIGTERM, signal.SIGKILL]
