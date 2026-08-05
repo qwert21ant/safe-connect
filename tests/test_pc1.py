@@ -74,3 +74,25 @@ async def test_audit_parses_logon_events():
 async def test_probe_rdp_is_false_when_nothing_listens():
     client = PC1Client(make_config(pc1_tailnet_ip="127.0.0.1"), runner=FakeRunner())
     assert await client.probe_rdp(timeout=0.3) is False
+
+
+@pytest.mark.parametrize(
+    "invalid_json",
+    ["null", "3", "[1,2,3]", '"hello"'],
+)
+async def test_non_dict_json_response_raises_pc1_error(invalid_json: str):
+    runner = FakeRunner([Result(0, invalid_json, "")])
+    with pytest.raises(PC1Error, match="unparseable"):
+        await PC1Client(make_config(), runner=runner).enable()
+
+
+async def test_audit_rejects_nan_epoch():
+    client = PC1Client(make_config(), runner=FakeRunner())
+    with pytest.raises(PC1Error):
+        await client.audit(float("nan"))
+
+
+async def test_audit_rejects_infinity_epoch():
+    client = PC1Client(make_config(), runner=FakeRunner())
+    with pytest.raises(PC1Error):
+        await client.audit(float("inf"))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 
 from bot import proc
@@ -49,6 +50,8 @@ class PC1Client:
         return bool((await self._call("status")).get("rdp_enabled", False))
 
     async def audit(self, since_epoch: float) -> AuditReport:
+        if not math.isfinite(since_epoch):
+            raise PC1Error(f"audit epoch must be finite, got {since_epoch}")
         payload = await self._call(f"audit {int(since_epoch)}")
         return AuditReport(
             successes=[LogonEvent(**item) for item in payload.get("successes", [])],
@@ -92,6 +95,8 @@ class PC1Client:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise PC1Error(f"unparseable agent response: {result.stdout[:200]!r}") from exc
+        if not isinstance(payload, dict):
+            raise PC1Error(f"unparseable agent response: expected dict, got {type(payload).__name__}")
         if not payload.get("ok"):
             raise PC1Error(f"agent refused: {payload.get('error', 'no reason given')}")
         return payload
