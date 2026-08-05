@@ -87,6 +87,23 @@ def handle_help() -> str:
     )
 
 
+async def _reply(message: Message, text: str) -> None:
+    """Send a handler's reply as plain text.
+
+    Deliberately no parse_mode: reply text can embed operator-supplied values
+    (e.g. repr() of a hostile /rdp_on argument) or PC1 audit-log data whose
+    Markdown entities are not guaranteed to be balanced -- an odd number of
+    "_", "*", "`" or "[" is enough. aiogram's dispatcher wraps handler
+    execution in a bare except Exception and logs it, so a Telegram 400
+    "can't parse entities" from a Markdown-mode send means message.answer(...)
+    never completes and the operator gets no reply at all -- indistinguishable
+    from the auth middleware's intentional silence toward an unauthorised
+    sender. Plain text has no entities to fail to parse, so a reply sent this
+    way is always delivered.
+    """
+    await message.answer(text)
+
+
 async def _tick_loop(manager: SessionManager, interval: int) -> None:
     while True:
         await asyncio.sleep(interval)
@@ -116,19 +133,19 @@ async def main() -> None:
 
     @dispatcher.message(Command("rdp_on"))
     async def _on(message: Message) -> None:
-        await message.answer(await handle_rdp_on(message.text or "", manager), parse_mode="Markdown")
+        await _reply(message, await handle_rdp_on(message.text or "", manager))
 
     @dispatcher.message(Command("rdp_off"))
     async def _off(message: Message) -> None:
-        await message.answer(await handle_rdp_off(manager), parse_mode="Markdown")
+        await _reply(message, await handle_rdp_off(manager))
 
     @dispatcher.message(Command("status"))
     async def _status(message: Message) -> None:
-        await message.answer(handle_status(manager), parse_mode="Markdown")
+        await _reply(message, handle_status(manager))
 
     @dispatcher.message(Command("help", "start"))
     async def _help(message: Message) -> None:
-        await message.answer(handle_help(), parse_mode="Markdown")
+        await _reply(message, handle_help())
 
     try:
         await manager.reconcile()

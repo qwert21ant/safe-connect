@@ -1,9 +1,16 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 
-from bot.main import AuthMiddleware, handle_help, handle_rdp_off, handle_rdp_on, handle_status
+from bot.main import (
+    AuthMiddleware,
+    _reply,
+    handle_help,
+    handle_rdp_off,
+    handle_rdp_on,
+    handle_status,
+)
 
 
 @dataclass
@@ -15,6 +22,18 @@ class FakeUser:
 class FakeMessage:
     text: str
     from_user: FakeUser
+
+
+@dataclass
+class FakeAnswerMessage:
+    """A message that records what was actually handed to Telegram's send call."""
+
+    text: str
+    from_user: FakeUser
+    sent: list = field(default_factory=list)
+
+    async def answer(self, text, **kwargs):
+        self.sent.append((text, kwargs))
 
 
 async def test_rdp_on_opens_a_session_for_a_valid_address(manager, parts):
@@ -34,6 +53,43 @@ async def test_rdp_on_rejects_a_hostile_argument_before_reaching_the_session(man
     assert parts["forwarder"].started == []
     assert parts["pc1"].calls == []
     assert "not" in reply.lower()
+
+
+async def test_rdp_on_rejects_underscored_input_that_would_break_markdown(manager, parts):
+    # repr() of the raw argument lands in the reply un-escaped. An odd number
+    # of "_" is enough to make Telegram's Markdown parser choke on the
+    # message if it were ever sent with parse_mode="Markdown" -- the send
+    # would then fail with a 400 and the operator would get nothing at all,
+    # indistinguishable from being locked out by the auth middleware. This
+    # pins that handle_rdp_on still produces a real, non-empty rejection
+    # reply for such input; test_reply_never_sets_a_parse_mode below pins the
+    # other half: that the reply is actually delivered regardless of its
+    # content.
+    reply = await handle_rdp_on("/rdp_on 1_2", manager)
+    assert parts["forwarder"].started == []
+    assert "not" in reply.lower()
+    assert "1_2" in reply
+
+
+async def test_reply_never_sets_a_parse_mode():
+    # _reply is the single choke point every handler's text passes through
+    # before Telegram sees it. Plain text (no parse_mode) can never fail to
+    # parse -- there are no entities to balance -- so this is the property
+    # that guarantees a reply is always delivered, no matter what a handler
+    # embedded in it.
+    message = FakeAnswerMessage(text="/rdp_on 1_2", from_user=FakeUser(id=1))
+    await _reply(message, "unbalanced *markdown_ entities `here")
+    assert message.sent == [("unbalanced *markdown_ entities `here", {})]
+
+
+async def test_a_markdown_breaking_rdp_on_reply_still_reaches_the_operator(manager, parts):
+    message = FakeAnswerMessage(text="/rdp_on 1_2", from_user=FakeUser(id=1))
+    reply = await handle_rdp_on(message.text, manager)
+    await _reply(message, reply)
+    assert message.sent, "the operator must receive something, never silence"
+    sent_text, kwargs = message.sent[0]
+    assert sent_text == reply
+    assert "parse_mode" not in kwargs
 
 
 async def test_rdp_on_any_is_accepted_and_warned_about(manager, parts):
