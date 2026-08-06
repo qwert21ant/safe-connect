@@ -1,0 +1,40 @@
+[Unit]
+Description=Safe Connect — on-demand RDP access broker
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=safeconnect
+Group=safeconnect
+WorkingDirectory=/opt/safe-connect
+Environment=SAFE_CONNECT_CONFIG=/etc/safe-connect/config.toml
+EnvironmentFile=/etc/safe-connect/env
+ExecStart=/opt/safe-connect/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+# NoNewPrivileges is deliberately absent, and CapabilityBoundingSet below is
+# deliberately non-empty: both are required for the sudo call to ufw-port,
+# which is how per-session firewall rules are applied. NoNewPrivileges blocks
+# the setuid transition sudo needs; an empty bounding set would let sudo
+# reach uid 0 but hand it zero capabilities (the kernel intersects the
+# binary's permitted set with the bounding set on execve), so ufw's
+# netfilter calls would fail with an empty set anyway. This is the accepted
+# cost of on-demand per-session firewall rules -- see docs/SECURITY.md. Do
+# not tighten either setting without also removing the sudo grant.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_AUDIT_WRITE
+ReadWritePaths=/var/lib/safe-connect
+
+[Install]
+WantedBy=multi-user.target

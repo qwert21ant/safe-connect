@@ -1,0 +1,7 @@
+# The bot's only privileged capability. The wrapper validates the port range and
+# the source CIDR before it calls ufw; a bare grant on /usr/sbin/ufw would let a
+# compromised bot write arbitrary rules, including deleting the SSH allow rule.
+#
+# Never add env_keep here: ufw-port reads SAFE_CONNECT_* overrides that exist for
+# its test suite, and sudo's default env_reset is what keeps them unreachable.
+safeconnect ALL=(root) NOPASSWD: /usr/local/lib/safe-connect/ufw-port
