@@ -76,7 +76,7 @@ Highest impact first.
 | 2 | Active on-path attacker on the VDS harvests RDP credentials via a substituted TLS endpoint | Certificate pinning is optional, not default (Accepted risk) | NLA is required (`UserAuthentication=1`); Appendix A closes this if applied |
 | 3 | Telegram account takeover opens the port to an attacker-chosen IP | No second factor on `/rdp_on` (Accepted risk) | Attacker still needs PC1 credentials; Telegram cloud-password 2FA; Appendix B |
 | 4 | Stolen VDS-side SSH private key | Forced command limits it to `enable`/`disable`/`status`/`audit` | No shell, no file write, no port forwarding; key file ACL SYSTEM+Administrators only |
-| 5 | Compromised bot process on the VDS escalates beyond its narrow sudo grant | `ufw-port` re-validates port range and CIDR shape independently of the bot | `NOPASSWD` scoped to one root-owned, non-writable script; systemd sandboxing (`ProtectSystem=strict`, emptied-except-for-sudo capability set — see below) |
+| 5 | Compromised bot process on the VDS escalates beyond its narrow sudo grant | `ufw-port` re-validates port range and CIDR shape independently of the bot | `NOPASSWD` scoped to one root-owned, non-writable script; systemd sandboxing (`ProtectSystem=strict`, capability set narrowed to just what `sudo` and `ufw`'s netfilter calls need — see below) |
 | 6 | Brute-force RDP login during an open session | Session is time-bounded and IP-restricted, but a valid credential guess within the window still succeeds | Account lockout policy (5 attempts / 15 min) set by `install-pc1.ps1`; NLA; idle/hard-cap timers bound the window |
 | 7 | Telegram sees command traffic, including PC2's public IP | Telegram chats are not end-to-end encrypted | Accepted; no mitigation shipped |
 | 8 | A compromised Tailscale account or coordination server introduces a rogue node | Tailnet lock and device approval, once enabled, require an existing signing key or manual approval | Runbook step 2 (Tailscale setup) |
@@ -136,10 +136,11 @@ Each entry below is a deliberate design trade-off recorded in
 This project cannot reach the VDS or PC1: none of the above was exercised
 against real infrastructure by this codebase. `bot/`, `agent/agent.ps1`'s
 verb dispatch, `deploy/ufw-port`, and the argv-only subprocess boundary are
-covered by the automated test suite (146 tests, see `docs/RUNBOOK.md` step
-8). Everything that requires real hosts — the forced command actually being
-in effect, the tailnet ACL actually being default-deny, the systemd
-capability set actually being sufficient and not more — is verified by the
-operator following `docs/RUNBOOK.md`'s per-step checks, in particular
-**step 7**, which is the only check that proves the forced command is
-really in force.
+covered by the automated test suite (146 tests, see `docs/RUNBOOK.md`
+section 9, "Run the socat integration tests on the VDS"). Everything that
+requires real hosts — the forced command actually being in effect, the
+tailnet ACL actually being default-deny, the systemd capability set
+actually being sufficient and not more — is verified by the operator
+following `docs/RUNBOOK.md`'s per-step checks, in particular **section 8,
+"Verify the forced command actually restricts the key"**, which is the
+only check that proves the forced command is really in force.

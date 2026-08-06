@@ -16,7 +16,13 @@ $ConfigPath = Join-Path $PSScriptRoot 'agent.config.json'
 $RuleName   = 'SafeConnect-RDP-In'
 $RegPath    = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
 
-function Write-Reply([hashtable]$Payload) {
+function Write-Reply([System.Collections.IDictionary]$Payload) {
+    # IDictionary, not [hashtable]: binding an [ordered]@{} literal to a
+    # [hashtable]-typed parameter silently converts it back to a plain,
+    # unordered Hashtable (verified empirically -- the key order then comes
+    # out in hash-bucket order, not insertion order), which would quietly
+    # undo the point of every [ordered]@{} call site below. IDictionary
+    # accepts the OrderedDictionary as-is.
     $Payload | ConvertTo-Json -Compress -Depth 5
 }
 
@@ -86,14 +92,14 @@ try {
     switch ($verb) {
         'enable' {
             Enable-Rdp
-            Write-Reply @{ ok = $true }
+            Write-Reply ([ordered]@{ ok = $true })
         }
         'disable' {
             Disable-Rdp
-            Write-Reply @{ ok = $true }
+            Write-Reply ([ordered]@{ ok = $true })
         }
         'status' {
-            Write-Reply @{ ok = $true; rdp_enabled = (Get-RdpEnabled) }
+            Write-Reply ([ordered]@{ ok = $true; rdp_enabled = (Get-RdpEnabled) })
         }
         'audit' {
             if ($parts.Count -ne 2 -or $parts[1] -notmatch '^[0-9]{1,12}$') {
@@ -101,13 +107,18 @@ try {
             }
             $since  = [datetimeoffset]::FromUnixTimeSeconds([int64]$parts[1]).LocalDateTime
             $events = Get-LogonEvents -Since $since
-            Write-Reply @{ ok = $true; successes = $events.successes; failures = $events.failures }
+            Write-Reply ([ordered]@{ ok = $true; successes = $events.successes; failures = $events.failures })
         }
         default {
             throw "unknown verb: $verb"
         }
     }
 } catch {
-    Write-Reply @{ ok = $false; error = "$($_.Exception.Message)" }
+    # [ordered] here too: the runbook's forced-command check documents the
+    # exact byte sequence {"ok":false,"error":"..."} as a pass/fail string
+    # comparison. A plain @{} hashtable's enumeration order is unspecified,
+    # so ConvertTo-Json could just as legitimately emit {"error":...,"ok":...}
+    # -- correct, but a false negative against that check.
+    Write-Reply ([ordered]@{ ok = $false; error = "$($_.Exception.Message)" })
     exit 0   # the transport succeeded; the payload carries the failure
 }

@@ -6,8 +6,9 @@ fix it before moving on; later steps assume earlier ones actually hold, not
 just that the commands were typed.
 
 Read `docs/SECURITY.md` first, or at least in parallel: it explains *why*
-each of these steps exists, in particular why **step 8 is the one that must
-never be skipped**.
+each of these steps exists, in particular why **section 8, "Verify the
+forced command actually restricts the key," is the one that must never be
+skipped**.
 
 A note on ordering: this runbook installs the **VDS before PC1**, even
 though PC1 is the machine being protected. That is not arbitrary —
@@ -284,10 +285,10 @@ With `journalctl -u safe-connect -f` still open in one terminal:
    grammatically singular for a count of 1; harmless, just don't be
    surprised by `1 failures`.)
 
-*Verify, on the VDS:* while the session from step 2–4 is open,
+*Verify, on the VDS:* while the session from list items 2–4 above is open,
 `ss -ltn | grep :<port>` shows a `LISTEN` line; `sudo ufw status | grep
-<port>` shows an `ALLOW` rule for it. After step 5, both commands show
-nothing for that port.
+<port>` shows an `ALLOW` rule for it. After list item 5 (`/rdp_off`), both
+commands show nothing for that port.
 
 ## 8. Verify the forced command actually restricts the key — do not skip this
 
@@ -368,10 +369,11 @@ itself is failing — try the manual `status` command from step 4 again and
 read the stderr.
 
 **socat cannot bind** (`/rdp_on` replies `Could not open a public port
-after three attempts`) — something else is already listening on ports in
-40000–40100 on the VDS, or `ufw`'s state is inconsistent. Check `ss -ltn`
-for stray listeners and `sudo ufw status numbered` for leftover rules from
-a previous crashed session; `sudo ufw delete <n>` to clear one.
+after three attempts. Nothing was opened.`) — something else is already
+listening on ports in 40000–40100 on the VDS, or `ufw`'s state is
+inconsistent. Check `ss -ltn` for stray listeners and `sudo ufw status
+numbered` for leftover rules from a previous crashed session; `sudo ufw
+delete <n>` to clear one.
 
 **`sudo: a password is required`** — the sudoers fragment at
 `/etc/sudoers.d/safe-connect` is missing, wrong, or was hand-edited badly.
