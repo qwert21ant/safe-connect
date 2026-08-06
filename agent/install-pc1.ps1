@@ -19,6 +19,39 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw 'Run this from an elevated PowerShell prompt.'
 }
 
+Write-Output '==> validating VdsPublicKey'
+# Checked on the RAW value, before any Trim(): a newline anywhere -- leading, trailing, or
+# embedded -- means Set-Content below would write more than one line to
+# administrators_authorized_keys. A leading/trailing newline is an easy copy-paste slip
+# (install-vds.sh prints the key for the operator to paste here), and the result is an
+# UNRESTRICTED key line with no forced-command prefix: full admin SSH to this PC. Reject
+# outright rather than trying to silently "fix" it by trimming newlines away.
+if ($VdsPublicKey -match '[\r\n]') {
+    throw ('VdsPublicKey contains a newline or carriage return, so it cannot be written as a ' +
+        'single authorized_keys line. Paste exactly the one key line printed by ' +
+        'install-vds.sh (starting with the key type, e.g. "ssh-ed25519 AAAA... safe-connect"), ' +
+        'with no blank line before or after it.')
+}
+$VdsPublicKey = $VdsPublicKey.Trim()
+if ($VdsPublicKey -notmatch '^\S+\s+[A-Za-z0-9+/]+=*(\s+\S.*)?$') {
+    throw ("VdsPublicKey does not look like a single OpenSSH public key line " +
+        "(expected '<type> <base64-body> [comment]', e.g. 'ssh-ed25519 AAAA... safe-connect'). " +
+        "Got: '$VdsPublicKey'")
+}
+
+function Invoke-IcaclsOrThrow([string]$Description, [string[]]$IcaclsArgs) {
+    # icacls is an external exe: a non-zero exit code is NOT promoted to a terminating
+    # error by $ErrorActionPreference = 'Stop' on Windows PowerShell 5.1
+    # ($PSNativeCommandUseErrorActionPreference doesn't exist there), so a failed icacls
+    # would otherwise be silently swallowed by "| Out-Null" and the script would print
+    # "Done" as though the lockdown succeeded. For $InstallDir specifically that fails
+    # OPEN: agent.ps1 could stay writable by non-administrators.
+    & icacls @IcaclsArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed while $Description (exit code $LASTEXITCODE). Refusing to continue: this permission lockdown is a required security property."
+    }
+}
+
 Write-Output '==> OpenSSH Server'
 $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*'
 if ($capability.State -ne 'Installed') {
@@ -34,7 +67,9 @@ Copy-Item -Path (Join-Path $PSScriptRoot 'agent.ps1') -Destination $InstallDir -
     Set-Content -Path (Join-Path $InstallDir 'agent.config.json') -Encoding ASCII
 
 Write-Output '==> locking down the agent so a low-privilege foothold cannot rewrite it'
-icacls $InstallDir /inheritance:r /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' | Out-Null
+Invoke-IcaclsOrThrow -Description 'locking down the agent install directory' -IcaclsArgs @(
+    $InstallDir, '/inheritance:r', '/grant', 'SYSTEM:(OI)(CI)F', '/grant', 'Administrators:(OI)(CI)F'
+)
 
 Write-Output '==> forced-command key'
 # NOTE: `(& ssh -V) 2>&1` would merge sshd's version banner (written to stderr) into the
@@ -60,12 +95,17 @@ $keyFile = 'C:\ProgramData\ssh\administrators_authorized_keys'
 # a file with exactly one surviving line turns "$kept + $forced" into *string*
 # concatenation instead of array-append, silently splicing two authorized_keys entries
 # onto a single garbled line (and losing whichever key didn't win the splice) on re-run.
+# Blank/whitespace-only lines are also dropped on every rebuild -- not just filtered by key
+# body -- so any blank line (however it got there) is cleaned up rather than accumulating
+# one more copy each time the script re-runs.
 $existing = if (Test-Path $keyFile) { @(Get-Content $keyFile) } else { @() }
 $keyBody = ($VdsPublicKey -split '\s+')[1]
-$kept = @($existing | Where-Object { $_ -notmatch [regex]::Escape($keyBody) })
+$kept = @($existing | Where-Object { $_.Trim() -ne '' -and $_ -notmatch [regex]::Escape($keyBody) })
 Set-Content -Path $keyFile -Value ($kept + $forced) -Encoding ASCII
 
-icacls $keyFile /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
+Invoke-IcaclsOrThrow -Description 'locking down administrators_authorized_keys' -IcaclsArgs @(
+    $keyFile, '/inheritance:r', '/grant', 'SYSTEM:F', '/grant', 'Administrators:F'
+)
 
 Write-Output '==> making sure RDP starts disabled'
 Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
