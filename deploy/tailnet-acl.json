@@ -1,0 +1,14 @@
+{
+  "tagOwners": {
+    "tag:vds": ["autogroup:admin"],
+    "tag:pc1": ["autogroup:admin"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:vds"],
+      "dst": ["tag:pc1:22,3389"]
+    }
+  ],
+  "ssh": []
+}
