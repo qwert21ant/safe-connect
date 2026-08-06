@@ -34,7 +34,15 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_AUDIT_WRITE
-ReadWritePaths=/var/lib/safe-connect
+
+# ProtectSystem=strict mounts the whole hierarchy read-only inside this unit's
+# mount namespace, and the sudo -> ufw child inherits it. A read-only mount
+# refuses writes regardless of uid, so root is not enough: ufw persists rules to
+# /etc/ufw/user.rules, and the iptables-restore it shells out to takes
+# /run/xtables.lock. Both must be carved out or /rdp_on fails with
+# "'/etc/ufw/user.rules' is not writable" -- see docs/SECURITY.md.
+# /var/lib/safe-connect is the bot's own state (state.json, ssh known_hosts).
+ReadWritePaths=/var/lib/safe-connect /etc/ufw /run
 
 [Install]
 WantedBy=multi-user.target

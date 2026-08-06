@@ -375,6 +375,33 @@ inconsistent. Check `ss -ltn` for stray listeners and `sudo ufw status
 numbered` for leftover rules from a previous crashed session; `sudo ufw
 delete <n>` to clear one.
 
+**`ufw-port open failed: ERROR: '/etc/ufw/user.rules' is not writable`** —
+the sudo call reached root (you'll see `session opened for user root` in
+`journalctl -u safe-connect`), but the write was refused by the sandbox, not
+by file permissions. `ProtectSystem=strict` mounts the filesystem read-only
+inside the unit's mount namespace and the `sudo` → `ufw` child inherits it;
+a read-only mount refuses writes regardless of uid, so being root doesn't
+help. The unit must carve out both paths `ufw` needs:
+
+```
+ReadWritePaths=/var/lib/safe-connect /etc/ufw /run
+```
+
+`/etc/ufw` for `user.rules`/`user6.rules`, `/run` for the
+`/run/xtables.lock` that `iptables-restore` takes. To confirm this is the
+cause rather than real permissions, run the same command from an
+interactive shell, outside the service's namespace:
+
+```bash
+sudo -u safeconnect sudo -n /usr/local/lib/safe-connect/ufw-port open 40082 203.0.113.9/32
+```
+
+If that succeeds while the service's identical call fails, it is the
+namespace. If it also fails, check `lsattr /etc/ufw/user.rules` for an
+immutable flag. Apply the fix by re-running `sudo deploy/install-vds.sh`,
+which reinstalls the unit, reloads systemd, and restarts the service if it
+was already running.
+
 **`sudo: a password is required`** — the sudoers fragment at
 `/etc/sudoers.d/safe-connect` is missing, wrong, or was hand-edited badly.
 Re-run `sudo deploy/install-vds.sh` (it validates with `visudo -cf` before

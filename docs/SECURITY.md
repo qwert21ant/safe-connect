@@ -122,14 +122,44 @@ Each entry below is a deliberate design trade-off recorded in
   netfilter calls would fail regardless of sudo succeeding. The bounding set
   is scoped to exactly `CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
   CAP_SETPCAP CAP_AUDIT_WRITE` — what `sudo` and `ufw` need — not the full
-  default set. All other systemd sandboxing stays on:
-  `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
-  `ReadWritePaths=/var/lib/safe-connect` only, and a restricted
-  `RestrictAddressFamilies`. **No appendix closes this** — removing it means
-  removing the narrow-sudo design (channel 4) entirely, which is a larger
-  change than this project's scope; it is recorded here so a future reviewer
-  does not "fix" it by re-adding `NoNewPrivileges` and silently breaking
-  session teardown.
+  default set.
+
+  A third concession belongs to the same family: `ProtectSystem=strict` stays
+  on, but `ReadWritePaths` had to widen from `/var/lib/safe-connect` alone to
+  also include `/etc/ufw` and `/run`. `ProtectSystem=strict` mounts the whole
+  hierarchy read-only inside the unit's mount namespace, and the `sudo` → `ufw`
+  child inherits it; a read-only mount refuses writes regardless of uid, so
+  reaching root is not sufficient. `ufw` persists rules to
+  `/etc/ufw/user.rules`, and the `iptables-restore` it shells out to takes
+  `/run/xtables.lock`. Without those two carve-outs, `/rdp_on` fails with
+  `'/etc/ufw/user.rules' is not writable` — which is how this was found, at
+  runtime on the real VDS rather than in review.
+
+  `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictNamespaces`, `LockPersonality`,
+  `MemoryDenyWriteExecute` and the restricted `RestrictAddressFamilies` all
+  remain in force.
+
+  **No appendix closes any of the three** — they are the price of the
+  narrow-sudo design (channel 4), and removing them means removing that design
+  entirely. They are recorded here so a future reviewer does not "fix" them by
+  re-adding `NoNewPrivileges`, emptying the bounding set, or trimming
+  `ReadWritePaths`, each of which silently breaks session setup or teardown.
+
+  **A note for whoever revisits this.** All three concessions were discovered
+  in sequence, each later than the last: `NoNewPrivileges` at design time, the
+  bounding set in review, `ReadWritePaths` only in production. Each removes a
+  layer of sandboxing from a process reachable from Telegram. That progression
+  is evidence about the architecture, not three unrelated bugs — running `ufw`
+  under `sudo` inside a hardened unit's namespace fights the container by
+  design. The alternative considered and deferred is to pre-open the whole
+  configured port range in `ufw` once at install time and let socat's own
+  `range=` option do per-session source filtering. That needs no sudo, no
+  capabilities and no namespace carve-outs, so it restores
+  `NoNewPrivileges=yes`, an empty `CapabilityBoundingSet`, and
+  `ReadWritePaths=/var/lib/safe-connect` alone. Its cost is that `ufw status`
+  permanently lists an open range on which nothing listens unless a session is
+  live. If a fourth concession ever becomes necessary, take that as the signal
+  to switch.
 
 ## Verification limits
 
