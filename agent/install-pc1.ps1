@@ -66,9 +66,19 @@ Copy-Item -Path (Join-Path $PSScriptRoot 'agent.ps1') -Destination $InstallDir -
 @{ vds_tailnet_ip = $VdsTailnetIp } | ConvertTo-Json |
     Set-Content -Path (Join-Path $InstallDir 'agent.config.json') -Encoding ASCII
 
+# *S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators. These well-known SIDs are
+# locale-independent; the readable names "SYSTEM" / "Administrators" are NOT -- on a
+# Russian-locale Windows the built-in group is actually named "Администраторы", and icacls
+# fails to resolve the English literal (exit 1332, "account could not be mapped"), which
+# used to be swallowed silently and now (correctly) aborts the install. PC1 is a home PC
+# and may well be installed in any language, so do NOT "clean this up" back to plain names
+# -- that reintroduces the failure on every non-English Windows.
+$SystemSid = '*S-1-5-18'
+$AdministratorsSid = '*S-1-5-32-544'
+
 Write-Output '==> locking down the agent so a low-privilege foothold cannot rewrite it'
 Invoke-IcaclsOrThrow -Description 'locking down the agent install directory' -IcaclsArgs @(
-    $InstallDir, '/inheritance:r', '/grant', 'SYSTEM:(OI)(CI)F', '/grant', 'Administrators:(OI)(CI)F'
+    $InstallDir, '/inheritance:r', '/grant', "${SystemSid}:(OI)(CI)F", '/grant', "${AdministratorsSid}:(OI)(CI)F"
 )
 
 Write-Output '==> forced-command key'
@@ -104,7 +114,7 @@ $kept = @($existing | Where-Object { $_.Trim() -ne '' -and $_ -notmatch [regex]:
 Set-Content -Path $keyFile -Value ($kept + $forced) -Encoding ASCII
 
 Invoke-IcaclsOrThrow -Description 'locking down administrators_authorized_keys' -IcaclsArgs @(
-    $keyFile, '/inheritance:r', '/grant', 'SYSTEM:F', '/grant', 'Administrators:F'
+    $keyFile, '/inheritance:r', '/grant', "${SystemSid}:F", '/grant', "${AdministratorsSid}:F"
 )
 
 Write-Output '==> making sure RDP starts disabled'
@@ -118,10 +128,29 @@ Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\W
     -Name 'UserAuthentication' -Value 1 -Type DWord
 
 Write-Output '==> account lockout policy (5 attempts, 15 minutes)'
+# net accounts takes only fixed English switch names (no account/group names), so unlike
+# icacls and auditpol it is locale-safe -- confirmed empirically (unelevated, this box):
+# the switches parse fine and the only failure is "Access is denied", not a syntax error.
+# Still check the exit code: a silently-failed lockout policy would leave the RDP account
+# without brute-force protection, which the design relies on.
 & net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "net accounts failed to set the lockout policy (exit code $LASTEXITCODE). Refusing to continue: brute-force protection on the RDP account is a required security property."
+}
 
 Write-Output '==> enabling logon auditing so /rdp_off can report sessions'
-& auditpol /set /subcategory:"Logon" /success:enable /failure:enable | Out-Null
+# {0CCE9215-69AE-11D9-BED3-505054503030} is the well-known, locale-independent GUID for the
+# "Logon" audit subcategory (confirmed via `auditpol /list /subcategory:* /v` on this box:
+# it's the first entry under the "Logon/Logoff" category). The readable name "Logon" is
+# localized -- on this Russian-locale Windows the subcategory is actually named
+# "Вход в систему", and auditpol rejects the English literal outright (exit 87, invalid
+# parameter) before it ever gets to the privileged operation. Same rule as the icacls SIDs
+# above: don't swap this back for a readable name, it will break on non-English Windows.
+$LogonAuditGuid = '{0CCE9215-69AE-11D9-BED3-505054503030}'
+& auditpol /set /subcategory:"$LogonAuditGuid" /success:enable /failure:enable | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "auditpol failed to enable logon auditing (exit code $LASTEXITCODE). Refusing to continue: without this, the audit verb silently reports no logons instead of reporting that auditing is off."
+}
 
 Restart-Service sshd
 Write-Output ''
