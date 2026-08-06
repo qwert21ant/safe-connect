@@ -71,16 +71,39 @@ install -o root -g root -m 0644 "$REPO/deploy/safe-connect.service" /etc/systemd
 systemctl daemon-reload
 systemctl enable safe-connect.service
 
-cat <<'DONE'
+# Restart only when the unit is already active: daemon-reload and enable
+# never touch a running process, so without this a rerun would copy new
+# code into place and leave the old code running under it indefinitely --
+# Restart=always never fires because nothing crashes. An unconditional
+# restart was rejected: on a first install the unit is inactive, and
+# starting it here would run the bot before the operator has edited
+# config.toml or supplied the token, producing a crash-loop. is-active
+# exits non-zero for an inactive unit -- the normal first-install case --
+# so this must stay inside a condition, never a bare statement, under
+# set -e.
+restarted=0
+if systemctl is-active --quiet safe-connect.service; then
+  systemctl restart safe-connect.service
+  restarted=1
+fi
+
+if [ "$restarted" -eq 1 ]; then
+  cat <<'DONE'
+
+Installed and restarted the running service with the updated code.
+DONE
+else
+  cat <<'DONE'
 
 Installed. Remaining steps, in order:
   1. edit /etc/safe-connect/config.toml
   2. put the bot token in /etc/safe-connect/env
   3. add this public key to PC1 (see docs/RUNBOOK.md step 4):
 DONE
-cat "$STATEDIR/id_ed25519.pub"
-cat <<'DONE'
+  cat "$STATEDIR/id_ed25519.pub"
+  cat <<'DONE'
   4. accept PC1's host key once:
        sudo -u safeconnect ssh -i /var/lib/safe-connect/id_ed25519 <user>@<pc1-tailnet-ip> status
   5. systemctl start safe-connect && journalctl -u safe-connect -f
 DONE
+fi
