@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Protocol
 
@@ -47,6 +47,7 @@ class SessionState:
     last_connection_at: float | None = None
     saw_connection: bool = False
     hard_cap_warned: bool = False
+    pc1_dirty: bool = False
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -86,7 +87,14 @@ class SessionManager:
             return SessionState()
         try:
             return SessionState.from_dict(json.loads(path.read_text()))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
+            # ValueError covers malformed JSON syntax. TypeError covers
+            # syntactically valid JSON that isn't an object -- e.g. the file
+            # contains "null", "3", or "[1]" -- where json.loads() succeeds
+            # but SessionState.from_dict()'s dict(data) then raises TypeError,
+            # not ValueError. Left uncaught, that TypeError used to propagate
+            # out of SessionManager.__init__() in main() before reconcile()
+            # ever ran, crash-looping the bot under systemd's Restart=always.
             log.warning("state file unreadable, assuming closed", exc_info=True)
             return SessionState()
 
@@ -111,19 +119,21 @@ class SessionManager:
             await self._pc1.enable()
         except PC1Error as exc:
             log.warning("enabling RDP on PC1 failed: %s", exc)
+            # enable() itself failed, so RDP was never actually turned on --
+            # nothing to track as outstanding.
             self._reset()
             return f"PC1 unreachable — is it powered on and on the tailnet?\n\n{exc}"
 
         if not await self._pc1.probe_rdp():
             log.warning("RDP probe failed after enable")
-            await self._rollback_pc1()
-            self._reset()
+            pc1_ok = await self._rollback_pc1()
+            self._reset(pc1_dirty=not pc1_ok)
             return "RDP was enabled on PC1 but port 3389 did not answer over the tailnet. Nothing was opened."
 
         port, pid = await self._start_forwarder(source)
         if port is None:
-            await self._rollback_pc1()
-            self._reset()
+            pc1_ok = await self._rollback_pc1()
+            self._reset(pc1_dirty=not pc1_ok)
             return "Could not open a public port after three attempts. Nothing was opened."
 
         now = self._clock.now()
@@ -141,39 +151,58 @@ class SessionManager:
     async def _start_forwarder(self, source: str) -> tuple[int | None, int | None]:
         for _ in range(BIND_ATTEMPTS):
             port = self._rng.randint(self._config.port_range_start, self._config.port_range_end)
+            # Persist this attempt's port BEFORE calling forwarder.start(), not
+            # after it returns: forwarder.start() opens the ufw rule before it
+            # spawns socat, so a hard crash partway through it can leave that
+            # rule up with nothing on disk pointing at it. Writing the port
+            # here first means reconcile() -> close() always has enough state
+            # to call forwarder.stop(None, port, source) and remove it, no
+            # matter which attempt was in flight when the crash happened.
+            self.state.port = port
+            self.state.source = source
+            self._save()
             try:
                 return port, await self._forwarder.start(port, source)
             except ForwarderError as exc:
                 log.warning("could not start forwarder on %s: %s", port, exc)
         return None, None
 
-    async def _rollback_pc1(self) -> None:
+    async def _rollback_pc1(self) -> bool:
         try:
             await self._pc1.disable()
+            return True
         except PC1Error as exc:
             log.error("rollback of PC1 failed: %s", exc)
+            return False
 
-    def _reset(self) -> None:
-        self.state = SessionState()
+    def _reset(self, pc1_dirty: bool = False) -> None:
+        self.state = SessionState(pc1_dirty=pc1_dirty)
         self._save()
 
     # -- closing ---------------------------------------------------------
 
     async def close(self, reason: str) -> str:
         if self.state.state is State.CLOSED:
-            return "Session is not open."
+            if not self.state.pc1_dirty:
+                return "Session is not open."
+            # A previous close() got the public port shut but PC1's disable()
+            # failed -- the session itself has nothing left to tear down, but
+            # PC1 may still have RDP enabled toward the VDS. Retry PC1 alone.
+            return await self._retry_pc1_cleanup()
 
         opened_at = self.state.opened_at or self._clock.now()
         port, source, pid = self.state.port, self.state.source, self.state.socat_pid
         self.state.state = State.CLOSING
         self._save()
 
+        forwarder_ok = True
         if port is not None and source is not None:
             try:
                 await self._forwarder.stop(pid, port, source)
             except Exception as exc:  # noqa: BLE001 -- fail-forward: pc1.disable()
                 # below must always be attempted once teardown has been tried,
                 # so an exception type we didn't anticipate must not skip it.
+                forwarder_ok = False
                 log.error("stopping the forwarder failed: %s", exc, exc_info=True)
 
         pc1_ok = True
@@ -184,15 +213,39 @@ class SessionManager:
             log.error("disabling RDP on PC1 failed: %s", exc)
 
         audit_line = await self._audit_line(opened_at)
-        self._reset()
+        self._reset(pc1_dirty=not pc1_ok)
 
         elapsed = int((self._clock.now() - opened_at) // 60)
-        header = f"Session closed after {elapsed}m ({reason})."
+        problems = []
+        if not forwarder_ok:
+            # port is captured above, before _reset() wipes self.state, so it
+            # survives here even though the session record itself is gone.
+            problems.append(
+                f"Closing the public port on {port} FAILED — it is likely still "
+                f"open on the VDS. Check 'sudo ufw status' there and remove it "
+                f"manually (sudo ufw delete ...) if so."
+            )
         if not pc1_ok:
-            header = (f"Public port closed after {elapsed}m ({reason}).\n"
-                      f"PC1 cleanup FAILED — RDP may still be enabled on PC1. "
-                      f"Retry with /rdp_off.")
+            problems.append(
+                "PC1 cleanup FAILED — RDP may still be enabled on PC1. "
+                "Retry with /rdp_off."
+            )
+        if problems:
+            header = f"Session close after {elapsed}m ({reason}) had problems:\n" + "\n".join(problems)
+        else:
+            header = f"Session closed after {elapsed}m ({reason})."
         return f"{header}\n{audit_line}"
+
+    async def _retry_pc1_cleanup(self) -> str:
+        try:
+            await self._pc1.disable()
+        except PC1Error as exc:
+            log.error("retry of PC1 cleanup failed: %s", exc)
+            return ("Session is not open, but PC1 cleanup is still outstanding "
+                    f"— RDP may still be enabled on PC1.\n{exc}")
+        self.state.pc1_dirty = False
+        self._save()
+        return "PC1 cleanup completed. RDP is now disabled on PC1."
 
     async def _audit_line(self, since: float) -> str:
         try:
@@ -212,6 +265,9 @@ class SessionManager:
 
     def describe(self) -> str:
         if self.state.state is State.CLOSED:
+            if self.state.pc1_dirty:
+                return ("Closed, but PC1 cleanup did not complete — RDP may still "
+                        "be enabled on PC1. Use /rdp_off to retry.")
             return "Closed. No public port, RDP disabled on PC1."
         if self.state.state is not State.OPEN:
             return f"{self.state.state.value.capitalize()}…"

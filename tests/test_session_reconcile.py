@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from bot.session import SessionManager, State
 
 
@@ -61,6 +63,25 @@ async def test_a_closed_state_file_needs_no_action(parts):
 async def test_a_corrupt_state_file_is_treated_as_closed(parts):
     parts["config"].state_path.parent.mkdir(parents=True, exist_ok=True)
     parts["config"].state_path.write_text("{ this is not json")
+
+    manager = SessionManager(**parts)
+
+    assert manager.state.state is State.CLOSED
+
+
+@pytest.mark.parametrize("content", ["null", "3", "[1, 2]", '"open"'])
+async def test_a_syntactically_valid_but_non_object_state_file_is_treated_as_closed(parts, content):
+    """FINDING 7: json.loads() happily parses "null"/"3"/"[1]" -- syntactically
+
+    valid JSON that isn't an object. SessionState.from_dict() then does
+    dict(data), which raises TypeError, not ValueError. The old `except
+    (OSError, ValueError):` in _load() let that TypeError propagate out of
+    SessionManager.__init__() in main() before reconcile() ever ran, which
+    would crash-loop the bot under systemd's Restart=always with a possibly
+    still-open port and nothing tearing it down.
+    """
+    parts["config"].state_path.parent.mkdir(parents=True, exist_ok=True)
+    parts["config"].state_path.write_text(content)
 
     manager = SessionManager(**parts)
 
