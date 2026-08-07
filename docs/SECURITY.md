@@ -161,6 +161,36 @@ Each entry below is a deliberate design trade-off recorded in
   live. If a fourth concession ever becomes necessary, take that as the signal
   to switch.
 
+## A dead code branch, and why it must stay that way
+
+`SessionManager.reconcile()` has an "adopted a live session" branch: if the
+persisted state says `open` and the recorded `socat` pid is still alive,
+the bot resumes tracking it instead of tearing it down. In the default
+deployment this branch never fires. `deploy/safe-connect.service` sets no
+`KillMode`, so systemd's default (`control-group`) applies: every process
+in the unit's cgroup is killed on `systemctl stop`/`restart`, including the
+live `socat` listener and any in-progress RDP connection through it —
+`_spawn_socat`'s `start_new_session=True` changes socat's *session and
+process group* (so `_terminate()` can kill it and its forked children as a
+unit without also killing the bot), not its *cgroup*, and only `KillMode`
+controls what a cgroup-based stop/restart reaches. By the time a restarted
+bot process calls `reconcile()`, there is nothing left alive to adopt.
+
+This is safe as shipped — nothing leaks; the ufw rule and PC1's RDP still
+need normal `/rdp_off`/timeout teardown next time, same as any other
+stale-state cleanup — it just means `systemctl restart safe-connect` always
+drops an active session rather than surviving it (see `docs/RUNBOOK.md`,
+"A stale state file", for the operator-facing version of this note).
+
+**Do not "fix" this by adding `KillMode=mixed` (or `process`) without
+treating it as a deliberate behavioural change**, not a bug fix. Letting
+`socat` survive a bot restart means a compromised or buggy new bot process
+inherits a live, already-authenticated public relay to PC1 with no
+opportunity to re-validate it, and means `reconcile()`'s adoption path
+starts actually running in production for the first time — worth deciding
+on purpose, with its own review, not as a drive-by cleanup of "unreachable"
+code.
+
 ## Verification limits
 
 This project cannot reach the VDS or PC1: none of the above was exercised

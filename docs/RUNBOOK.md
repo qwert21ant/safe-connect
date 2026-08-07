@@ -106,7 +106,9 @@ enables it (allowing first matters — enabling with default-deny-incoming
 and no SSH rule yet would cut off the very SSH session running the
 installer); and installs and enables the systemd unit, restarting it only
 if it was already running (so a first install never starts the bot before
-you've supplied a token, and a later re-run picks up new code immediately).
+you've supplied a token, and a later re-run picks up new code immediately —
+but if a session happens to be open when you re-run this for an update,
+that restart drops it; see "A stale state file" in section 10).
 
 At the end it prints the VDS's SSH public key. **Copy it now** — you need
 it for the next step.
@@ -400,7 +402,9 @@ If that succeeds while the service's identical call fails, it is the
 namespace. If it also fails, check `lsattr /etc/ufw/user.rules` for an
 immutable flag. Apply the fix by re-running `sudo deploy/install-vds.sh`,
 which reinstalls the unit, reloads systemd, and restarts the service if it
-was already running.
+was already running. **If a session is open when you do this, that restart
+drops it** — see the note under "A stale state file" below; the drop is
+safe (nothing leaks) but the operator loses RDP access mid-session.
 
 **`sudo: a password is required`** — the sudoers fragment at
 `/etc/sudoers.d/safe-connect` is missing, wrong, or was hand-edited badly.
@@ -417,12 +421,24 @@ hand: `SessionManager.reconcile()` runs on every startup and tears down any
 `open` state whose recorded `socat` pid isn't alive, sending you a
 `cleanup after a bot restart` notification. If the bot isn't restarting on
 its own, `sudo systemctl restart safe-connect` forces reconciliation.
+**This drops any currently-open RDP session** — `safe-connect.service` sets
+no `KillMode`, so systemd's default (`control-group`) applies: every
+process in the unit's cgroup, including the live `socat` and any
+in-progress RDP connection through it, is killed on every stop/restart, not
+just the bot's own Python process. That is why `reconcile()`'s "adopted a
+live session" branch is never actually observed in normal operation — there
+is no live session left to adopt by the time the new process starts. The
+drop itself is safe (the ufw rule and PC1's RDP get torn down the same way
+any other stale-state cleanup does), it just means `systemctl restart` is
+not a way to pick up new code or fix a wedged bot *without* interrupting
+whoever is currently connected.
 
 **Telegram not polling** — `journalctl -u safe-connect -e` for the actual
 exception; `aiogram` logs failures from `dispatcher.start_polling` loudly.
 A `401 Unauthorized` there means the token in `/etc/safe-connect/env` is
 wrong or was revoked; regenerate it with `@BotFather` → `/revoke` (or
-`/token`) and update the file, then `sudo systemctl restart safe-connect`.
+`/token`) and update the file, then `sudo systemctl restart safe-connect`
+(drops any open session — see "A stale state file" above).
 
 ## Appendix A: pinning PC1's RDP certificate on PC2
 

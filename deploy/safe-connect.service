@@ -14,6 +14,16 @@ ExecStart=/opt/safe-connect/.venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
 
+# No KillMode is set, so systemd's default (control-group) applies: every
+# process in this unit's cgroup -- including a live socat listener and any
+# in-progress RDP connection through it -- is killed on every stop/restart,
+# not just the bot's own python process. This is intentional; do not add
+# KillMode=mixed/process as a "fix" without treating it as a deliberate
+# behavioural change (it lets socat survive a bot restart, which changes
+# what SessionManager.reconcile()'s "adopted a live session" branch does in
+# practice -- see docs/SECURITY.md, "A dead code branch, and why it must
+# stay that way").
+
 # NoNewPrivileges is deliberately absent, and CapabilityBoundingSet below is
 # deliberately non-empty: both are required for the sudo call to ufw-port,
 # which is how per-session firewall rules are applied. NoNewPrivileges blocks
