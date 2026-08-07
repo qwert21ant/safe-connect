@@ -3,7 +3,9 @@
 Run these on the VDS too, as part of the runbook smoke test.
 """
 import asyncio
+import os
 import shutil
+import signal
 import socket
 from pathlib import Path
 
@@ -138,6 +140,46 @@ async def test_stop_severs_an_already_established_session(holding_forwarder):
     writer.write(b"in-session")
     await writer.drain()
     assert await holding_forwarder.established_count(port) >= 1
+
+    await holding_forwarder.stop(pid, port, "any")
+    await asyncio.sleep(0.5)
+
+    # EOF means the relay really is gone. A hang means the forked child lives on.
+    assert await asyncio.wait_for(reader.read(1), timeout=5) == b""
+    assert await holding_forwarder.established_count(port) == 0
+    writer.close()
+
+
+async def test_stop_reaps_forked_children_when_the_listener_died_first(holding_forwarder):
+    """A listener that is already dead by the time stop() runs must not leave
+
+    its already-forked child relaying forever. This reproduces FINDING 1: the
+    `_is_socat(pid)` early-return in _terminate() reads /proc/<listener-pid>
+    and, once the listener is gone, always returns False -- so _terminate()
+    silently no-ops instead of signalling the group, and the child that
+    already forked off an in-flight connection is orphaned and keeps
+    relaying past stop(), close(), reconcile() and every timer.
+
+    This is exactly test_stop_severs_an_already_established_session above,
+    except the listener is SIGKILLed out from under stop() first, standing in
+    for "the listener already crashed / was reaped by something else" -- the
+    only path tick()/reconcile() have for a dead listener is is_alive() being
+    False, which is precisely the condition that made the old guard a no-op.
+    """
+    port = free_port()
+    pid = await holding_forwarder.start(port, "any")
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"in-session")
+    await writer.drain()
+    assert await holding_forwarder.established_count(port) >= 1
+
+    os.kill(pid, signal.SIGKILL)
+    for _ in range(50):
+        if not holding_forwarder.is_alive(pid, port):
+            break
+        await asyncio.sleep(0.02)
+    assert not holding_forwarder.is_alive(pid, port), "listener must be confirmed dead first"
 
     await holding_forwarder.stop(pid, port, "any")
     await asyncio.sleep(0.5)

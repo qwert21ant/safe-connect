@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import time
@@ -10,11 +11,50 @@ from bot import proc
 from bot.config import Config
 from bot.proc import ProcTimeout
 
+log = logging.getLogger(__name__)
+
 RDP_PORT = 3389
 _LISTEN_POLL_INTERVAL = 0.1
 _LISTEN_POLL_ATTEMPTS = 20
 _TERMINATE_POLL_INTERVAL = 0.05
 _TERMINATE_POLL_ATTEMPTS = 10  # ~0.5s of grace after SIGTERM before SIGKILL
+_REAP_TIMEOUT = 5.0  # bound on waiting for a signalled socat to actually exit
+_STDERR_TAIL_BYTES = 4096
+
+
+async def _drain_stderr(stream: asyncio.StreamReader) -> bytes:
+    """Keep socat's stderr pipe from filling and blocking it, for as long as it runs.
+
+    stderr=PIPE with nobody reading it risks a chatty socat blocking on a
+    full pipe once the kernel buffer fills. This drains it continuously and
+    keeps only the last _STDERR_TAIL_BYTES, which _finish_drain() surfaces
+    for diagnostics if socat exits unexpectedly -- previously that text was
+    discarded entirely, leaving /rdp_on failures with only a bare exit code.
+    Cancellation (the normal way this is stopped, once the process is
+    reaped) is caught and turned into a normal return rather than left to
+    propagate, so callers always get a result instead of having to handle
+    CancelledError themselves.
+    """
+    tail = bytearray()
+    try:
+        while True:
+            chunk = await stream.read(_STDERR_TAIL_BYTES)
+            if not chunk:
+                return bytes(tail[-_STDERR_TAIL_BYTES:])
+            tail.extend(chunk)
+            del tail[:-_STDERR_TAIL_BYTES]
+    except asyncio.CancelledError:
+        return bytes(tail[-_STDERR_TAIL_BYTES:])
+
+
+async def _finish_drain(drain: "asyncio.Task[bytes]") -> bytes:
+    """Stop a drain task and collect what it saw. Never raises."""
+    if not drain.done():
+        drain.cancel()
+    try:
+        return await drain
+    except asyncio.CancelledError:
+        return b""
 
 
 class ForwarderError(RuntimeError):
@@ -33,6 +73,7 @@ class Forwarder:
         self._run = runner
         self._spawn = spawn
         self._processes: dict[int, object] = {}
+        self._stderr_drains: dict[int, "asyncio.Task[bytes]"] = {}
 
     async def start(self, port: int, source: str) -> int:
         await self._ufw("open", port, source)
@@ -60,7 +101,25 @@ class Forwarder:
                     # asyncio's subprocess transport finalizes itself later via
                     # __del__, which can fire after the loop has closed and print
                     # "Exception ignored ... Event loop is closed" noise.
-                    await process.wait()
+                    #
+                    # Bounded: this sits between _terminate() (which already
+                    # signalled the group, up to and including SIGKILL) and
+                    # the ufw close below, which the comment above promises
+                    # runs on every path. An unbounded wait() here would
+                    # silently break that promise if the process ever failed
+                    # to actually exit after SIGKILL (e.g. stuck in
+                    # uninterruptible sleep) -- the ufw close must not be
+                    # held hostage by that.
+                    try:
+                        await asyncio.wait_for(process.wait(), _REAP_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "socat pid %s did not exit within %ss of being "
+                            "signalled; closing the ufw rule anyway", pid, _REAP_TIMEOUT,
+                        )
+                drain = self._stderr_drains.pop(pid, None)
+                if drain is not None:
+                    await _finish_drain(drain)
         await self._ufw("close", port, source)
         if terminate_error is not None:
             raise terminate_error
@@ -122,16 +181,36 @@ class Forwarder:
             # socat would share the bot's group and killing it would kill us.
             start_new_session=True,
         )
-        for _ in range(_LISTEN_POLL_ATTEMPTS):
-            await asyncio.sleep(_LISTEN_POLL_INTERVAL)
-            if process.returncode is not None:
-                raise ForwarderError(f"socat exited immediately with {process.returncode}")
-            if await self._is_listening(port):
-                self._processes[process.pid] = process
-                return process.pid
-        self._terminate(process.pid)
-        await process.wait()  # reap it now; see stop()'s comment on why
-        raise ForwarderError(f"socat did not listen on {port} within 2s")
+        # Drains stderr for socat's whole life so a chatty socat can never
+        # block on a full pipe (stderr=PIPE with nobody reading it). Started
+        # unconditionally, right after spawn, so it is also there to capture
+        # socat's own diagnostic text if it exits immediately below.
+        drain = asyncio.ensure_future(_drain_stderr(process.stderr))
+        try:
+            for _ in range(_LISTEN_POLL_ATTEMPTS):
+                await asyncio.sleep(_LISTEN_POLL_INTERVAL)
+                if process.returncode is not None:
+                    detail = (await _finish_drain(drain)).decode(errors="replace").strip()
+                    suffix = f": {detail}" if detail else ""
+                    raise ForwarderError(f"socat exited immediately with {process.returncode}{suffix}")
+                if await self._is_listening(port):
+                    self._processes[process.pid] = process
+                    self._stderr_drains[process.pid] = drain
+                    return process.pid
+            raise ForwarderError(f"socat did not listen on {port} within 2s")
+        except Exception:
+            # Whatever raised -- "did not listen", "exited immediately", or
+            # something escaping _is_listening() (e.g. a ForwarderError
+            # wrapping ProcTimeout from a wedged ss) -- the process this
+            # function already spawned must not outlive this function.
+            # Without this, only the "did not listen" path used to clean up;
+            # any other exception left an unsupervised socat holding a port
+            # in the configured range with nothing in state.json pointing at
+            # it, invisible to reconcile() and every timer.
+            self._terminate(process.pid)
+            await process.wait()  # reap it now; see stop()'s comment on why
+            await _finish_drain(drain)
+            raise
 
     async def _is_listening(self, port: int) -> bool:
         try:
@@ -154,10 +233,42 @@ class Forwarder:
         # SIGTERM first, then poll for the group to drain before escalating to
         # SIGKILL, so the KILL cannot land on a group the OS rebuilt under a
         # recycled pid.
-        if not self._is_socat(pid):
-            # Already gone, or the pid now belongs to something else entirely.
-            # Signalling a whole group on a recycled pid is not a risk worth
-            # taking; a dead listener has already stopped relaying.
+        #
+        # The refusal below must fire ONLY for genuine pid reuse: a real,
+        # different process -- with actual argv -- sits at this pid. It must
+        # NOT fire just because the listener itself is gone or has died but
+        # not yet been reaped -- socat runs with `fork`, so a listener that
+        # already exited (crashed, was SIGKILLed by something else) can
+        # still have live forked children relaying an in-flight connection,
+        # and is_alive()/tick()/reconcile() have no other path to reach them
+        # than this one. Linux will not recycle a pid number while any live
+        # task -- including one of those orphaned children, or the dead
+        # listener itself sitting as an unreaped zombie -- still references
+        # it as its process-group id, so a non-empty group behind a vanished
+        # or zombified leader pid can only be our own children, never an
+        # unrelated process that reused the number. Treating "gone" the same
+        # as "reused" (as `if not self._is_socat(pid): return` used to) is
+        # exactly the pid-reuse guard defeating the fix it exists to guard.
+        #
+        # An earlier version of this fix distinguished "gone" from "reused"
+        # by separately checking /proc/<pid>/stat's state field for zombie
+        # status. That raced: a listener we just SIGKILLed can have its
+        # cmdline already cleared (read #1, via _is_socat, sees "empty" --
+        # looks gone) while /proc/<pid>/stat still transiently reports a
+        # non-zombie state a few microseconds longer (read #2 sees "live"),
+        # because the kernel does not clear a dying task's mm and flip its
+        # exit state atomically. Two DIFFERENT proc files, read at two
+        # different instants, described two different moments of the same
+        # death and together looked exactly like "pid already reused by a
+        # live process" -- reproduced empirically via
+        # test_stop_reaps_forked_children_when_the_listener_died_first in
+        # tests/test_forwarder_integration.py, which hung on exactly this
+        # under real socat. cmdline alone does not have that problem:
+        # emptiness is monotonic for a single
+        # process's lifetime (it goes non-empty -> empty exactly once, never
+        # back), so reading it twice (once for identity, once for
+        # emptiness) cannot disagree with itself the way stat-vs-cmdline did.
+        if not self._is_socat(pid) and not self._cmdline_is_empty(pid):
             return
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -185,6 +296,20 @@ class Forwarder:
             return b"socat" in Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             return False
+
+    @staticmethod
+    def _cmdline_is_empty(pid: int) -> bool:
+        """True once this pid's argv is gone -- zombie, fully reaped, or gone.
+
+        A zombie's /proc/<pid>/cmdline reads back as empty bytes, the same as
+        a fully-reaped pid raising OSError; both are treated identically
+        here (and both are safe to treat as "still ours, proceed") since
+        pid reuse cannot happen until a zombie is actually reaped.
+        """
+        try:
+            return not Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return True
 
     @staticmethod
     def _group_exists(pgid: int) -> bool:

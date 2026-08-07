@@ -1,10 +1,11 @@
+import asyncio
 import signal
 from pathlib import Path
 
 import pytest
 
 from bot.config import Config
-from bot.forwarder import Forwarder, ForwarderError
+from bot.forwarder import _REAP_TIMEOUT, Forwarder, ForwarderError
 from bot.proc import ProcTimeout, Result
 
 
@@ -41,10 +42,25 @@ class TimingOutRunner:
         raise ProcTimeout(f"timed out after {timeout}s: {argv[0]}")
 
 
+class FakeStderr:
+    """Stands in for asyncio.StreamReader: one bounded .read(), then EOF."""
+
+    def __init__(self, data: bytes = b""):
+        self._data = data
+        self._sent = False
+
+    async def read(self, n=-1):
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._data
+
+
 class FakeProcess:
-    def __init__(self, pid=4242, returncode=None):
+    def __init__(self, pid=4242, returncode=None, stderr_data: bytes = b""):
         self.pid = pid
         self.returncode = returncode
+        self.stderr = FakeStderr(stderr_data)
 
     async def communicate(self):
         return b"", b"socat: bind failed"
@@ -108,6 +124,26 @@ async def test_ufw_rule_is_rolled_back_when_socat_never_listens():
         await fwd.start(40017, "203.0.113.9/32")
 
     assert runner.calls[-1][-3:] == ["close", "40017", "203.0.113.9/32"]
+
+
+async def test_socat_exiting_immediately_surfaces_its_stderr_text():
+    """FINDING 6: socat's own diagnostic text was discarded entirely on the
+
+    failure path, leaving /rdp_on failures diagnostically blind -- only a
+    bare exit code reached the operator. This pins that the drained stderr
+    text is folded into the ForwarderError message.
+    """
+    runner = FakeRunner([Result(0, "", "")])   # ufw open succeeds
+
+    async def spawn(*argv, **kwargs):
+        return FakeProcess(
+            returncode=1,
+            stderr_data=b"2026/08/08 socat[123] E bind(5, ...): Address already in use\n",
+        )
+
+    fwd = Forwarder(make_config(), runner=runner, spawn=spawn)
+    with pytest.raises(ForwarderError, match="Address already in use"):
+        await fwd.start(40017, "203.0.113.9/32")
 
 
 async def test_start_raises_when_ufw_refuses():
@@ -175,6 +211,31 @@ async def test_stop_still_closes_ufw_when_pid_is_unknown():
     assert runner.calls[0][-3:] == ["close", "40017", "any"]
 
 
+async def test_stop_closes_ufw_even_if_the_reaped_process_never_exits():
+    """FINDING 6: process.wait() after signalling must be bounded -- otherwise
+
+    a process that never actually exits after being signalled (stuck in
+    uninterruptible sleep, or just very slow) would delay the ufw close
+    indefinitely, contradicting stop()'s own comment that the close must run
+    on every path through here.
+    """
+    runner = FakeRunner()
+    fwd = Forwarder(make_config(), runner=runner, spawn=None)
+    fwd._terminate = lambda pid: None  # noqa: SLF001 -- pretend signalling succeeded
+
+    class HangingProcess:
+        async def wait(self):
+            await asyncio.Event().wait()  # never resolves
+
+    fwd._processes[4242] = HangingProcess()
+
+    # If the reap is unbounded, this whole call hangs and the outer
+    # wait_for is what actually fails the test (not a graceful assertion).
+    await asyncio.wait_for(fwd.stop(4242, 40017, "any"), timeout=_REAP_TIMEOUT + 5)
+
+    assert runner.calls[0][-3:] == ["close", "40017", "any"]
+
+
 async def test_stop_still_closes_ufw_when_terminate_fails():
     """A failed kill must not leave the public port open."""
     runner = FakeRunner()
@@ -227,6 +288,39 @@ async def test_start_raises_forwarder_error_when_listen_check_times_out():
 
     with pytest.raises(ForwarderError):
         await Forwarder(make_config(), runner=OpenThenTimingOutRunner(), spawn=spawn).start(40017, "any")
+
+
+async def test_spawned_process_is_terminated_when_the_listen_poll_raises():
+    """FINDING 4: an exception escaping the poll loop (e.g. ProcTimeout from ss,
+
+    wrapped as ForwarderError by _is_listening) must not leak the socat
+    process _spawn_socat already spawned. Before the fix, only the "did not
+    listen within 2s" branch terminated and reaped the process; any OTHER
+    exception -- like the one this test raises -- propagated straight out of
+    the poll loop, leaving an unsupervised socat holding a port with nothing
+    tracking it in state.json.
+    """
+
+    class OpenThenTimingOutRunner:
+        async def __call__(self, argv, timeout=30.0):
+            if argv[0] == "/usr/bin/sudo":
+                return Result(0, "", "")  # ufw open succeeds
+            raise ProcTimeout("ss wedged")  # the listen-check never answers
+
+    terminated = []
+    process = FakeProcess(pid=777)
+
+    async def spawn(*argv, **kwargs):
+        return process
+
+    fwd = Forwarder(make_config(), runner=OpenThenTimingOutRunner(), spawn=spawn)
+    fwd._terminate = lambda pid: terminated.append(pid)  # noqa: SLF001
+
+    with pytest.raises(ForwarderError):
+        await fwd.start(40017, "any")
+
+    assert terminated == [777], "the spawned process must be terminated, not leaked"
+    assert 777 not in fwd._processes, "a leaked process must not stay tracked either"
 
 
 def test_is_alive_is_false_for_a_pid_that_does_not_exist():
@@ -296,14 +390,68 @@ def test_terminate_signals_the_group_not_just_the_listener(monkeypatch):
 
 
 def test_terminate_refuses_to_signal_a_group_whose_leader_is_not_socat(monkeypatch):
-    """Guards against the pid having been recycled by an unrelated process."""
+    """Guards against the pid having been recycled by an unrelated process.
+
+    This is the genuine pid-reuse case: this pid's cmdline is a real,
+    non-empty argv and it is not socat. That is the only situation
+    _terminate may refuse to signal -- see the test below for the
+    pid-vanished/zombie case, which must NOT refuse.
+    """
     fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
 
     monkeypatch.setattr("bot.forwarder.os.killpg",
                         lambda pgid, sig: pytest.fail("signalled a recycled pid's group"))
     monkeypatch.setattr(Forwarder, "_is_socat", staticmethod(lambda pid: False))
+    monkeypatch.setattr(Forwarder, "_cmdline_is_empty", staticmethod(lambda pid: False))
 
     fwd._terminate(4242)
+
+
+def test_terminate_signals_the_group_when_listener_pid_is_gone_but_group_survives(monkeypatch):
+    """A dead listener whose forked children are still relaying must still be reaped.
+
+    socat runs with `fork`: killing only the listener leaves an in-flight
+    connection's forked child relaying forever if the listener has already
+    exited on its own (e.g. crashed) by the time _terminate runs. Linux will
+    not recycle a pid number while any live task -- including one of socat's
+    own forked children, or the dead listener itself sitting as an unreaped
+    zombie -- still references it as its process-group id, so a non-empty
+    group behind a vanished or zombified leader pid can only be our own
+    orphaned children, never an unrelated process. This is the defect the
+    earlier `if not self._is_socat(pid): return` guard reintroduced: it
+    treated "listener is gone" the same as "pid was recycled by something
+    else" and refused to signal either. cmdline_is_empty=True covers both
+    the zombie case (cmdline reads back b"") and the fully-reaped case
+    (/proc/<pid> gone entirely) identically, since both are safe to treat as
+    "still ours" -- see _cmdline_is_empty's docstring.
+    """
+    fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
+    group_signals = []
+
+    monkeypatch.setattr("bot.forwarder.os.killpg",
+                        lambda pgid, sig: group_signals.append((pgid, sig)))
+    monkeypatch.setattr("bot.forwarder.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(Forwarder, "_is_socat", staticmethod(lambda pid: False))
+    monkeypatch.setattr(Forwarder, "_cmdline_is_empty", staticmethod(lambda pid: True))
+
+    fwd._terminate(4242)
+
+    assert group_signals[0] == (4242, signal.SIGTERM)
+
+
+def test_cmdline_is_empty_is_true_for_a_zombies_empty_cmdline(monkeypatch):
+    """A zombie's /proc/<pid>/cmdline reads back as b"", not an OSError."""
+    monkeypatch.setattr("bot.forwarder.Path.read_bytes", lambda self: b"")
+    assert Forwarder._cmdline_is_empty(4242) is True
+
+
+def test_cmdline_is_empty_is_true_for_a_pid_that_no_longer_exists():
+    assert Forwarder._cmdline_is_empty(999999) is True
+
+
+def test_cmdline_is_empty_is_false_for_a_real_cmdline(monkeypatch):
+    monkeypatch.setattr("bot.forwarder.Path.read_bytes", lambda self: b"/usr/bin/ss\x00-Hltn\x00")
+    assert Forwarder._cmdline_is_empty(4242) is False
 
 
 async def test_spawn_puts_socat_in_its_own_session(monkeypatch):
