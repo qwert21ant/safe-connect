@@ -86,6 +86,68 @@ async def test_traffic_flows_and_stop_leaves_no_process(local_forwarder):
     assert not local_forwarder.is_alive(pid, port)
 
 
+@pytest.fixture
+async def holding_server():
+    """Accepts connections and holds them open, like a live RDP session would.
+
+    The echo_server above closes shortly after replying, so it cannot show
+    whether stop() actually severs an in-flight session.
+    """
+
+    async def handle(reader, writer):
+        try:
+            await reader.read()          # block until the peer disappears
+        except OSError:
+            pass
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    async with server:
+        yield port
+
+
+@pytest.fixture
+def holding_forwarder(holding_server, monkeypatch):
+    fwd = Forwarder(make_config(pc1_tailnet_ip="127.0.0.1"))
+
+    async def no_ufw(action, port, source):
+        return None
+
+    monkeypatch.setattr(fwd, "_ufw", no_ufw)
+    monkeypatch.setattr(fwd, "_socat_argv", lambda port, source: [
+        "socat",
+        f"TCP4-LISTEN:{port},fork,reuseaddr" + ("" if source == "any" else f",range={source}"),
+        f"TCP:127.0.0.1:{holding_server}",
+    ])
+    return fwd
+
+
+async def test_stop_severs_an_already_established_session(holding_forwarder):
+    """/rdp_off must cut a live session, not merely stop accepting new ones.
+
+    socat is spawned with `fork`, so it forks a child per accepted connection.
+    Killing only the listener pid leaves that child relaying an in-flight RDP
+    session indefinitely -- the public port stops accepting, but whoever is
+    already connected keeps working.
+    """
+    port = free_port()
+    pid = await holding_forwarder.start(port, "any")
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"in-session")
+    await writer.drain()
+    assert await holding_forwarder.established_count(port) >= 1
+
+    await holding_forwarder.stop(pid, port, "any")
+    await asyncio.sleep(0.5)
+
+    # EOF means the relay really is gone. A hang means the forked child lives on.
+    assert await asyncio.wait_for(reader.read(1), timeout=5) == b""
+    assert await holding_forwarder.established_count(port) == 0
+    writer.close()
+
+
 async def test_disallowed_source_is_dropped_by_the_range_option(local_forwarder):
     """range=203.0.113.9/32 must reject a connection arriving from 127.0.0.1."""
     port = free_port()

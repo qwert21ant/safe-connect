@@ -235,12 +235,12 @@ def test_is_alive_is_false_for_a_pid_that_does_not_exist():
 
 
 def test_terminate_skips_sigkill_when_sigterm_is_enough(monkeypatch):
-    """No liveness recheck between signals risks SIGKILL hitting a recycled pid."""
+    """No liveness recheck between signals risks SIGKILL hitting a recycled group."""
     fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
     signals_sent = []
     alive = True
 
-    def fake_kill(pid, sig):
+    def fake_killpg(pgid, sig):
         nonlocal alive
         if sig == signal.SIGTERM:
             signals_sent.append(sig)
@@ -251,26 +251,70 @@ def test_terminate_skips_sigkill_when_sigterm_is_enough(monkeypatch):
         else:
             signals_sent.append(sig)
 
-    monkeypatch.setattr("bot.forwarder.os.kill", fake_kill)
+    monkeypatch.setattr("bot.forwarder.os.killpg", fake_killpg)
     monkeypatch.setattr("bot.forwarder.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(Forwarder, "_is_socat", staticmethod(lambda pid: True))
 
     fwd._terminate(4242)
 
     assert signals_sent == [signal.SIGTERM]
 
 
-def test_terminate_escalates_to_sigkill_when_process_survives_sigterm(monkeypatch):
+def test_terminate_escalates_to_sigkill_when_group_survives_sigterm(monkeypatch):
     fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
     signals_sent = []
 
-    def fake_kill(pid, sig):
-        # The process never reports as gone via the signal-0 liveness probe.
+    def fake_killpg(pgid, sig):
+        # The group never reports as gone via the signal-0 liveness probe.
         if sig != 0:
             signals_sent.append(sig)
 
-    monkeypatch.setattr("bot.forwarder.os.kill", fake_kill)
+    monkeypatch.setattr("bot.forwarder.os.killpg", fake_killpg)
     monkeypatch.setattr("bot.forwarder.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(Forwarder, "_is_socat", staticmethod(lambda pid: True))
 
     fwd._terminate(4242)
 
     assert signals_sent == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_terminate_signals_the_group_not_just_the_listener(monkeypatch):
+    """socat forks a child per connection; only killpg reaches those children."""
+    fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
+    group_signals = []
+
+    monkeypatch.setattr("bot.forwarder.os.killpg",
+                        lambda pgid, sig: group_signals.append((pgid, sig)))
+    monkeypatch.setattr("bot.forwarder.os.kill",
+                        lambda pid, sig: pytest.fail("must not signal a single pid"))
+    monkeypatch.setattr("bot.forwarder.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(Forwarder, "_is_socat", staticmethod(lambda pid: True))
+
+    fwd._terminate(4242)
+
+    assert group_signals[0] == (4242, signal.SIGTERM)
+
+
+def test_terminate_refuses_to_signal_a_group_whose_leader_is_not_socat(monkeypatch):
+    """Guards against the pid having been recycled by an unrelated process."""
+    fwd = Forwarder(make_config(), runner=FakeRunner(), spawn=None)
+
+    monkeypatch.setattr("bot.forwarder.os.killpg",
+                        lambda pgid, sig: pytest.fail("signalled a recycled pid's group"))
+    monkeypatch.setattr(Forwarder, "_is_socat", staticmethod(lambda pid: False))
+
+    fwd._terminate(4242)
+
+
+async def test_spawn_puts_socat_in_its_own_session(monkeypatch):
+    """Without start_new_session, killpg would target the bot's own group."""
+    runner = FakeRunner([Result(0, "", ""), Result(0, "LISTEN 0 5 *:40017 *:*\n", "")])
+    captured = {}
+
+    async def spawn(*argv, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    await Forwarder(make_config(), runner=runner, spawn=spawn).start(40017, "any")
+
+    assert captured.get("start_new_session") is True

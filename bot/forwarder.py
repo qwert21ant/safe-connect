@@ -116,6 +116,11 @@ class Forwarder:
             *self._socat_argv(port, source),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            # Put socat in its own session, making its pid the leader of a fresh
+            # process group. _terminate() kills that whole group so the children
+            # socat forks per connection die with it; without the new session
+            # socat would share the bot's group and killing it would kill us.
+            start_new_session=True,
         )
         for _ in range(_LISTEN_POLL_ATTEMPTS):
             await asyncio.sleep(_LISTEN_POLL_INTERVAL)
@@ -138,33 +143,53 @@ class Forwarder:
         return result.ok and bool(result.stdout.strip())
 
     def _terminate(self, pid: int) -> None:
-        # SIGTERM first, then poll for the pid to actually exit before ever
-        # sending SIGKILL. Firing both signals back-to-back with no liveness
-        # check would risk the SIGKILL landing on a different process if the
-        # OS recycled the pid in between.
+        # Signal the whole process GROUP, not just this pid. socat runs with
+        # `fork`, so it forks a child per accepted connection; killing only the
+        # listener leaves that child relaying an in-flight RDP session
+        # indefinitely -- the port stops accepting while whoever is already
+        # connected keeps working, which would make /rdp_off a no-op against an
+        # active attacker. _spawn_socat starts socat in its own session, so its
+        # pid is also its process-group id and the group cannot reach the bot.
+        #
+        # SIGTERM first, then poll for the group to drain before escalating to
+        # SIGKILL, so the KILL cannot land on a group the OS rebuilt under a
+        # recycled pid.
+        if not self._is_socat(pid):
+            # Already gone, or the pid now belongs to something else entirely.
+            # Signalling a whole group on a recycled pid is not a risk worth
+            # taking; a dead listener has already stopped relaying.
+            return
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             return
         except PermissionError:
-            raise ForwarderError(f"not permitted to signal pid {pid}")
+            raise ForwarderError(f"not permitted to signal process group {pid}")
 
         for _ in range(_TERMINATE_POLL_ATTEMPTS):
-            if not self._pid_exists(pid):
+            if not self._group_exists(pid):
                 return
             time.sleep(_TERMINATE_POLL_INTERVAL)
 
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             return
         except PermissionError:
-            raise ForwarderError(f"not permitted to signal pid {pid}")
+            raise ForwarderError(f"not permitted to signal process group {pid}")
 
     @staticmethod
-    def _pid_exists(pid: int) -> bool:
+    def _is_socat(pid: int) -> bool:
+        """Confirm this pid is still our relay before signalling its group."""
         try:
-            os.kill(pid, 0)
+            return b"socat" in Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _group_exists(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
